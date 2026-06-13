@@ -151,6 +151,39 @@ a few cells wide, making the A* path and wind field look coarse. At 256×256:
 
 The FNO modes scale accordingly: `max(20, grid // 8)` = 32 at 256².
 
+## Why 4-side Zou-He BCs (not just left/right)?
+
+The original LBM only had left/right inlet BCs, which meant wind could only blow
+horizontally (angle=0° or 180°). Adding top/bottom BCs enables:
+- Any wind direction angle (0°–360°) via `--angle`
+- Gradual rotation during collection via `--angle-end`
+- Diagonal inlet conditions (e.g. 45°) activate two sides simultaneously
+
+Zou-He rho is computed from the correct subset of known distributions for each
+side. Corners are handled by letting the y-BC overwrite the x-BC (harmless since
+both set equilibrium at the same (ux_in, uy_in)).
+
+## Why is transient mode ON by default?
+
+The original `--transient` flag defaulted to off, so steady wind was the default.
+But steady LBM produces nearly identical snapshots — the neural network trains on
+effectively duplicate data and the visualization looks static.
+
+Transient (gusty) wind with two-frequency speed variation creates diverse
+snapshots that better train the U-FNO and produce a more realistic, dynamic
+visualization. The flag is now `--no-transient` to disable.
+
+## Why negate U in quiver set_UVC()?
+
+With `invert_xaxis()` on the plot axes, matplotlib's `quiver` still draws arrows
+in the raw screen-right direction for positive U, ignoring the axis flip. This
+caused arrows to point rightward (toward the inlet) instead of leftward (in the
+flow direction) for right-to-left wind.
+
+Fix: pass `-u` instead of `u` to `set_UVC()`. This makes the arrow appear
+leftward on screen, correctly indicating where the wind is going. The V component
+does not need negation — `origin='lower'` is handled correctly by quiver.
+
 ## Why m/s labels on colorbars?
 
 LBM units (dimensionless speeds 0.0–0.25) are not immediately interpretable

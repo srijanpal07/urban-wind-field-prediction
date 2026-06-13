@@ -100,27 +100,55 @@ class LBMSolver:
         for i in range(9):
             f[i][self.solid] = f_pre[self.opp[i]][self.solid]
 
-        # 3 & 4. Inlet/outlet BCs — side depends on flow direction
-        ux_full = torch.full((self.H,), self.ux_in, device=self.device)
-        uy_full = torch.full((self.H,), self.uy_in, device=self.device)
-        if self.ux_in >= 0:
-            # Inlet at LEFT (col=0), outlet at RIGHT — Zou-He for +x inflow
+        # 3 & 4. Inlet/outlet BCs — all 4 sides, auto-selected by flow direction
+        ux_in, uy_in = self.ux_in, self.uy_in
+
+        # Left / Right BCs (x-component of inlet velocity)
+        if ux_in > 0:
+            # Inlet at LEFT (col=0) — Zou-He for +x inflow
             rho_in = (f[0,:,0] + f[2,:,0] + f[4,:,0]
-                      + 2.0*(f[3,:,0] + f[6,:,0] + f[7,:,0])) / (1.0 - self.ux_in)
-            rho_in = rho_in.clamp(0.5, 1.5)
-            f[:, :, 0]  = self._equilibrium(rho_in, ux_full, uy_full)[:, :, 0]
-            f[:, :, -1] = f[:, :, -2]   # outlet: zero-gradient
-        else:
-            # Inlet at RIGHT (col=W-1), outlet at LEFT — Zou-He for -x inflow
+                      + 2.0*(f[3,:,0] + f[6,:,0] + f[7,:,0])) / (1.0 - ux_in)
+            rho_in = rho_in.clamp(0.5, 1.5).unsqueeze(1)      # [H, 1]
+            ux_bc  = torch.full((self.H, 1), ux_in, device=self.device)
+            uy_bc  = torch.full((self.H, 1), uy_in, device=self.device)
+            f[:, :, 0]  = self._equilibrium(rho_in, ux_bc, uy_bc)[:, :, 0]
+            f[:, :, -1] = f[:, :, -2]
+        elif ux_in < 0:
+            # Inlet at RIGHT (col=W-1) — Zou-He for -x inflow
             rho_in = (f[0,:,-1] + f[2,:,-1] + f[4,:,-1]
-                      + 2.0*(f[1,:,-1] + f[5,:,-1] + f[8,:,-1])) / (1.0 + self.ux_in)
-            rho_in = rho_in.clamp(0.5, 1.5)
-            f[:, :, -1] = self._equilibrium(rho_in, ux_full, uy_full)[:, :, -1]
-            f[:, :, 0]  = f[:, :, 1]    # outlet: zero-gradient
+                      + 2.0*(f[1,:,-1] + f[5,:,-1] + f[8,:,-1])) / (1.0 + ux_in)
+            rho_in = rho_in.clamp(0.5, 1.5).unsqueeze(1)      # [H, 1]
+            ux_bc  = torch.full((self.H, 1), ux_in, device=self.device)
+            uy_bc  = torch.full((self.H, 1), uy_in, device=self.device)
+            f[:, :, -1] = self._equilibrium(rho_in, ux_bc, uy_bc)[:, :, -1]
+            f[:, :, 0]  = f[:, :, 1]
+        else:
+            # No x-component: zero-gradient on both L/R sides
+            f[:, :, 0]  = f[:, :, 1]
+            f[:, :, -1] = f[:, :, -2]
 
-        # 5. Top/bottom: torch.roll in _stream already gives periodic BCs — no override needed
+        # Top / Bottom BCs (y-component of inlet velocity)
+        if uy_in > 0:
+            # Inlet at TOP (row=0) — Zou-He for +y inflow (downward in array)
+            rho_in = (f[0,0,:] + f[1,0,:] + f[3,0,:]
+                      + 2.0*(f[4,0,:] + f[7,0,:] + f[8,0,:])) / (1.0 - uy_in)
+            rho_in = rho_in.clamp(0.5, 1.5).unsqueeze(0)      # [1, W]
+            ux_bc  = torch.full((1, self.W), ux_in, device=self.device)
+            uy_bc  = torch.full((1, self.W), uy_in, device=self.device)
+            f[:, 0, :]  = self._equilibrium(rho_in, ux_bc, uy_bc)[:, 0, :]
+            f[:, -1, :] = f[:, -2, :]
+        elif uy_in < 0:
+            # Inlet at BOTTOM (row=H-1) — Zou-He for -y inflow (upward in array)
+            rho_in = (f[0,-1,:] + f[1,-1,:] + f[3,-1,:]
+                      + 2.0*(f[2,-1,:] + f[5,-1,:] + f[6,-1,:])) / (1.0 + uy_in)
+            rho_in = rho_in.clamp(0.5, 1.5).unsqueeze(0)      # [1, W]
+            ux_bc  = torch.full((1, self.W), ux_in, device=self.device)
+            uy_bc  = torch.full((1, self.W), uy_in, device=self.device)
+            f[:, -1, :] = self._equilibrium(rho_in, ux_bc, uy_bc)[:, -1, :]
+            f[:, 0, :]  = f[:, 1, :]
+        # else uy_in == 0: top/bottom remain periodic from torch.roll (correct for pure x-flow)
 
-        # 6. BGK Collision
+        # 5. BGK Collision
         rho, ux, uy = self._macroscopic(f)
         feq = self._equilibrium(rho, ux, uy)
         self.f = f - (f - feq) / self.tau
@@ -137,13 +165,15 @@ class LBMSolver:
 
     def run(self, n_warmup: int = 500, n_collect: int = 200, collect_every: int = 5,
             transient: bool = False, speed_variation: float = 0.25,
-            variation_period: int = 40):
+            variation_period: int = 40, angle_end: float = None):
         """
         Run solver: warmup phase then collect snapshots.
 
         transient        : vary inlet speed over time (gusty wind)
         speed_variation  : ± fraction of base speed (e.g. 0.25 = ±25%)
         variation_period : timesteps per gust cycle
+        angle_end        : if set, linearly rotate inlet angle from initial to
+                           angle_end (degrees) over the collection window
         Returns arrays of shape [T, H, W] for u and v.
         """
         print(f"Warming up ({n_warmup} steps)...")
@@ -152,24 +182,33 @@ class LBMSolver:
             if (i+1) % 100 == 0:
                 print(f"  Warmup step {i+1}/{n_warmup}")
 
-        base_speed = float(np.sqrt(self.ux_in**2 + self.uy_in**2))
-        angle_rad  = float(np.arctan2(self.uy_in, self.ux_in))
+        base_speed    = float(np.sqrt(self.ux_in**2 + self.uy_in**2))
+        angle_start   = float(np.arctan2(self.uy_in, self.ux_in))
+        angle_stop    = np.deg2rad(angle_end) if angle_end is not None else angle_start
 
-        mode_str = (f" — transient mode (±{speed_variation*100:.0f}%, "
-                    f"period={variation_period} steps)") if transient else ""
+        mode_parts = []
+        if transient:
+            mode_parts.append(f"transient (±{speed_variation*100:.0f}%, period={variation_period})")
+        if angle_end is not None:
+            mode_parts.append(f"rotating {np.rad2deg(angle_start):.0f}°→{angle_end:.0f}°")
+        mode_str = (" — " + ", ".join(mode_parts)) if mode_parts else ""
         print(f"Collecting {n_collect} snapshots (every {collect_every} steps){mode_str}...")
 
-        for i in range(n_collect * collect_every):
+        n_total = n_collect * collect_every
+        for i in range(n_total):
+            t = i / max(n_total - 1, 1)          # 0 → 1 over collection window
+            current_angle = angle_start + t * (angle_stop - angle_start)
+
+            spd = base_speed
             if transient:
-                # Two-frequency gust profile for realistic variation
                 factor = 1.0 + speed_variation * (
                     0.7 * np.sin(2 * np.pi * i / variation_period) +
                     0.3 * np.sin(2 * np.pi * i / (variation_period * 1.7))
                 )
-                factor = float(np.clip(factor, 0.2, 1.8))
-                spd = base_speed * factor
-                self.ux_in = spd * np.cos(angle_rad)
-                self.uy_in = spd * np.sin(angle_rad)
+                spd = base_speed * float(np.clip(factor, 0.2, 1.8))
+
+            self.ux_in = float(spd * np.cos(current_angle))
+            self.uy_in = float(spd * np.sin(current_angle))
 
             u, v = self.step()
             if i % collect_every == 0:

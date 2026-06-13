@@ -104,6 +104,8 @@
 │             Dark-theme tick labels (SUBTEXT color, size 6)      │
 │  Buildings: 2× upsample + Gaussian blur + contourf (smooth)    │
 │  Animation: FuncAnimation, 80ms interval, frame = timestep      │
+│  Quiver U:  negated (-u) to correct for invert_xaxis() —        │
+│             matplotlib quiver ignores axis inversion             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -113,16 +115,24 @@ Scheme: D2Q9 (2D, 9 velocity directions)
 Collision: BGK (single relaxation time τ)
 - τ = 0.7  →  ν = (τ - 0.5)/3 = 0.0667 (kinematic viscosity in LB units)
 
-Boundary conditions:
-- Inlet:      Fixed velocity (ux_in, uy_in) via Zou-He equilibrium BC
-              Left (col=0) if ux_in ≥ 0; Right (col=W-1) if ux_in < 0
-- Outlet:     Zero-gradient (copy from neighbor) — opposite side to inlet
-- Top/bottom: Periodic (torch.roll in streaming step)
-- Buildings:  Bounce-back (no-slip)
+Boundary conditions (4-side, auto-selected each step):
+- Left  (col=0):   Zou-He inlet if ux_in > 0; zero-gradient outlet otherwise
+- Right (col=W-1): Zou-He inlet if ux_in < 0; zero-gradient outlet otherwise
+- Top   (row=0):   Zou-He inlet if uy_in > 0; zero-gradient outlet otherwise
+- Bot   (row=H-1): Zou-He inlet if uy_in < 0; zero-gradient outlet otherwise
+- ux_in == 0: both L/R sides use zero-gradient (no override)
+- uy_in == 0: top/bottom remain periodic from torch.roll (correct for pure x-flow)
+- Buildings: Bounce-back (no-slip)
+- Corners: last-applied BC wins (y-BCs overwrite x-BCs at corners — harmless)
 
-Transient mode (`--transient`):
+Transient mode (ON by default, disable with `--no-transient`):
 - Inlet speed varies sinusoidally: factor = 1 + A*(0.7*sin(2πt/T) + 0.3*sin(2πt/1.7T))
 - Amplitude A=0.25, period T=40 steps, clamped to [0.2, 1.8]
+
+Wind direction rotation (`--angle-end`):
+- Inlet angle linearly interpolates from `--angle` to `--angle-end` over the
+  collection window. Warmup always runs at the starting angle.
+- All 4-side BCs update each step based on current (ux_in, uy_in).
 
 Stability: τ must be in (0.5, 2.0). Safe range: 0.6–0.9.
 Inlet speed: keep below 0.15 in LB units to stay subsonic (Ma < 0.3).
@@ -192,6 +202,8 @@ With default settings:
 | LBM tau        | 0.7    | Relaxation time                               |
 | inlet_speed    | 0.08   | LB units                                      |
 | inlet_angle    | 0.0°   | Right-to-left visually (col=0 inlet on right) |
+| inlet_angle_end| None   | If set, angle rotates linearly to this value  |
+| transient      | ON     | Gusty inlet by default; --no-transient to off |
 | ref_speed      | 10.0   | m/s reference at inlet (colorbar conversion)  |
 | n_warmup       | 400    | LBM steps before collecting                   |
 | n_collect      | 150    | Timesteps in dataset                          |

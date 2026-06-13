@@ -83,24 +83,28 @@ python run_pipeline.py --stl data/city_model.STL --no-train
 # Save animation (headless / after full pipeline run):
 python run_pipeline.py --stl data/city_model.STL --save outputs/wind_dashboard.gif
 
-# Transient (gusty) wind:
-python run_pipeline.py --stl data/city_model.STL --transient
+# Disable gusty wind (steady inlet):
+python run_pipeline.py --stl data/city_model.STL --no-transient
 
 # Override physical reference speed for colorbars:
 python run_pipeline.py --stl data/city_model.STL --ref-speed 8.0
+
+# Gradually rotate wind direction 90° during collection:
+python run_pipeline.py --stl data/city_model.STL --angle-end 90
 ```
 
 ### Key Defaults (run_pipeline.py)
-| Argument        | Default  | Notes                                      |
-|-----------------|----------|--------------------------------------------|
-| `--grid`        | 256      | Grid resolution (256×256)                  |
-| `--warmup`      | 400      | LBM warmup steps                           |
-| `--steps`       | 150      | LBM snapshot collection steps             |
-| `--speed`       | 0.08     | Inlet speed in LBM units                   |
-| `--angle`       | 0.0      | Inlet angle (0° = right-to-left visually)  |
-| `--ref-speed`   | 10.0     | Physical inlet speed in m/s for colorbars  |
-| `--epochs`      | 10       | Training epochs                            |
-| `--transient`   | off      | Enable gusty time-varying inlet            |
+| Argument          | Default  | Notes                                           |
+|-------------------|----------|-------------------------------------------------|
+| `--grid`          | 256      | Grid resolution (256×256)                       |
+| `--warmup`        | 400      | LBM warmup steps                                |
+| `--steps`         | 150      | LBM snapshot collection steps                   |
+| `--speed`         | 0.08     | Inlet speed in LBM units                        |
+| `--angle`         | 0.0      | Inlet angle (0° = right-to-left visually)       |
+| `--angle-end`     | None     | Rotate inlet angle to this value during collect |
+| `--ref-speed`     | 10.0     | Physical inlet speed in m/s for colorbars       |
+| `--epochs`        | 10       | Training epochs                                 |
+| `--no-transient`  | off      | Disable gusty wind (transient is ON by default) |
 
 ## Hardware
 - GPU: NVIDIA RTX 5000 Ada Generation, 32GB VRAM
@@ -116,9 +120,12 @@ python run_pipeline.py --stl data/city_model.STL --ref-speed 8.0
    - `invert_xaxis()` is applied to all visualization panels so col 0 appears on
      the right. Wind with angle=0° (ux_in>0) flows right→left visually.
 
-2. **LBM inlet side**: Automatically selected by sign of ux_in.
-   - ux_in ≥ 0: inlet at LEFT column (col=0), outlet at RIGHT (col=W-1)
-   - ux_in < 0: inlet at RIGHT column (col=W-1), outlet at LEFT (col=0)
+2. **LBM inlet side**: All 4 sides handled, auto-selected by sign of ux_in/uy_in.
+   - ux_in > 0: inlet at LEFT col (col=0), outlet at RIGHT (col=W-1)
+   - ux_in < 0: inlet at RIGHT col (col=W-1), outlet at LEFT (col=0)
+   - uy_in > 0: inlet at TOP row (row=0, bottom of display), outlet at BOTTOM (row=H-1, top of display)
+   - uy_in < 0: inlet at BOTTOM row (row=H-1), outlet at TOP (row=0)
+   - Multiple sides active simultaneously when angle is diagonal (e.g. 45°)
    - With invert_xaxis: col=0 appears on the right, so ux_in>0 gives right-to-left
      visual wind direction. Do NOT change this without updating the BC logic.
 
@@ -139,8 +146,18 @@ python run_pipeline.py --stl data/city_model.STL --ref-speed 8.0
 7. **m/s colorbars**: `lbm_to_ms = ref_speed / abs(inlet_speed)` (default 125×).
    Applied via `FuncFormatter` — underlying data always stays in LBM units.
 
-8. **LBM cache**: Keyed by MD5 of obstacle mask + sim_mode (steady/transient).
+8. **LBM cache**: Keyed by MD5 of obstacle mask + sim_mode string.
+   sim_mode encodes transient flag + start/end angles, e.g. `transient_a0_90`.
    Delete `data/lbm_data.npz` to force regeneration.
+
+9. **Quiver arrow direction**: The U component is negated (`-u`) in `set_UVC()`
+   calls in `visualize.py`. This compensates for `invert_xaxis()` — matplotlib
+   quiver draws positive U rightward on screen regardless of axis inversion, so
+   negating makes arrows correctly point in the visual flow direction.
+
+10. **Wind direction rotation**: `--angle-end` linearly rotates the inlet angle
+    from `--angle` to `--angle-end` degrees over the collection window. Warmup
+    always runs at the starting angle so flow is fully developed before rotation.
 
 9. **Phase 2 goal**: Replace U-FNO with a Latent Diffusion Model.
    **Phase 3 goal**: World Model (learned latent dynamics of urban wind).

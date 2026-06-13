@@ -36,6 +36,9 @@ def main():
     parser.add_argument('--ref-speed',  type=float, default=10.0,
                         help='Physical wind speed at inlet in m/s (for colorbar scaling)')
     parser.add_argument('--angle',      type=float, default=0.0)
+    parser.add_argument('--angle-end',  type=float, default=None,
+                        help='If set, linearly rotate wind direction to this angle (degrees) '
+                             'over the collection window. E.g. --angle 0 --angle-end 90')
     parser.add_argument('--epochs',     type=int,   default=50)
     parser.add_argument('--batch',      type=int,   default=8)
     parser.add_argument('--lr',         type=float, default=1e-3)
@@ -47,8 +50,8 @@ def main():
     parser.add_argument('--data-cache',    type=str,   default='data/lbm_data.npz')
     parser.add_argument('--slice-height',  type=float, default=None,
                         help='Height along up-axis to slice STL (default: 30%% of height range)')
-    parser.add_argument('--transient', action='store_true',
-                        help='Vary inlet wind speed over time (gusty/transient flow)')
+    parser.add_argument('--no-transient', action='store_true',
+                        help='Disable transient (gusty) inlet — use steady wind speed')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -81,7 +84,9 @@ def main():
     def _mask_hash(m):
         return hashlib.md5(m.tobytes()).hexdigest()
 
-    sim_mode = 'transient' if args.transient else 'steady'
+    angle_end_val = args.angle_end if args.angle_end is not None else args.angle
+    transient = not args.no_transient
+    sim_mode = ('transient' if transient else 'steady') + f'_a{args.angle:.0f}_{angle_end_val:.0f}'
     cache_hit = False
     if os.path.exists(args.data_cache):
         try:
@@ -111,7 +116,8 @@ def main():
         u_arr, v_arr = solver.run(n_warmup=args.warmup,
                                    n_collect=args.steps,
                                    collect_every=3,
-                                   transient=args.transient)
+                                   transient=transient,
+                                   angle_end=args.angle_end)
         np.savez(args.data_cache, u=u_arr, v=v_arr,
                  mask_hash=np.array([_mask_hash(obstacle_mask)]),
                  sim_mode=np.array([sim_mode]))

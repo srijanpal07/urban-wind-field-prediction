@@ -437,7 +437,7 @@ class Dashboard:
         self.im_gt.set_data(spd_gt)
         qs = self.qys
         qx = self.qxs
-        self.q_gt.set_UVC(u_gt[np.ix_(qs, qx)], v_gt[np.ix_(qs, qx)])
+        self.q_gt.set_UVC(-u_gt[np.ix_(qs, qx)], v_gt[np.ix_(qs, qx)])
         self.time_text_gt.set_text(f't={t:3d}')
 
         # ── Update Prediction panel ───────────────────────────────────────
@@ -445,7 +445,7 @@ class Dashboard:
         spd_pred = np.where(np.isnan(spd_pred), np.nan, spd_pred)
         self.im_pred.set_data(spd_pred)
         self.q_pred.set_UVC(
-            np.nan_to_num(u_pred)[np.ix_(qs, qx)],
+            -np.nan_to_num(u_pred)[np.ix_(qs, qx)],
             np.nan_to_num(v_pred)[np.ix_(qs, qx)])
         self.time_text_pred.set_text(f't={t:3d} (+horizon)')
 
