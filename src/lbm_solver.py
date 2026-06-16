@@ -165,15 +165,17 @@ class LBMSolver:
 
     def run(self, n_warmup: int = 500, n_collect: int = 200, collect_every: int = 5,
             transient: bool = False, speed_variation: float = 0.25,
-            variation_period: int = 40, angle_end: float = None):
+            variation_period: int = 40, angle_variation: float = 15.0,
+            angle_variation_period: int = 60, angle_end: float = None):
         """
         Run solver: warmup phase then collect snapshots.
 
-        transient        : vary inlet speed over time (gusty wind)
-        speed_variation  : ± fraction of base speed (e.g. 0.25 = ±25%)
-        variation_period : timesteps per gust cycle
-        angle_end        : if set, linearly rotate inlet angle from initial to
-                           angle_end (degrees) over the collection window
+        transient               : enable gusty wind (speed + direction disturbances)
+        speed_variation         : ± fraction of base speed (e.g. 0.25 = ±25%)
+        variation_period        : timesteps per speed-gust cycle
+        angle_variation         : ± degrees of directional wobble around primary direction
+        angle_variation_period  : timesteps per direction-wobble cycle (decorrelated from speed)
+        angle_end               : if set, linearly rotate primary angle to this value (degrees)
         Returns arrays of shape [T, H, W] for u and v.
         """
         print(f"Warming up ({n_warmup} steps)...")
@@ -188,7 +190,7 @@ class LBMSolver:
 
         mode_parts = []
         if transient:
-            mode_parts.append(f"transient (±{speed_variation*100:.0f}%, period={variation_period})")
+            mode_parts.append(f"transient (speed ±{speed_variation*100:.0f}%, dir ±{angle_variation:.0f}°)")
         if angle_end is not None:
             mode_parts.append(f"rotating {np.rad2deg(angle_start):.0f}°→{angle_end:.0f}°")
         mode_str = (" — " + ", ".join(mode_parts)) if mode_parts else ""
@@ -201,11 +203,19 @@ class LBMSolver:
 
             spd = base_speed
             if transient:
-                factor = 1.0 + speed_variation * (
+                # Speed gust: two overlapping sinusoids, ±speed_variation
+                speed_factor = 1.0 + speed_variation * (
                     0.7 * np.sin(2 * np.pi * i / variation_period) +
                     0.3 * np.sin(2 * np.pi * i / (variation_period * 1.7))
                 )
-                spd = base_speed * float(np.clip(factor, 0.2, 1.8))
+                spd = base_speed * float(np.clip(speed_factor, 0.2, 1.8))
+
+                # Direction wobble: different period to decorrelate from speed gusts
+                angle_perturb = np.deg2rad(angle_variation) * (
+                    0.6 * np.sin(2 * np.pi * i / angle_variation_period) +
+                    0.4 * np.sin(2 * np.pi * i / (angle_variation_period * 1.5))
+                )
+                current_angle += angle_perturb
 
             self.ux_in = float(spd * np.cos(current_angle))
             self.uy_in = float(spd * np.sin(current_angle))

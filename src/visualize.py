@@ -167,22 +167,22 @@ class Dashboard:
 
     def __init__(self, u_arr, v_arr, obstacle_mask, model=None,
                  device='cpu', drone_waypoints=None, stl_path=None,
-                 lbm_to_ms=1.0):
+                 lbm_to_ms=1.0, domain_m=None):
         self.u_arr = u_arr              # [T, H, W]
         self.v_arr = v_arr
         self.mask  = obstacle_mask      # [H, W] bool
         self.model = model
         self.device = device
         self.lbm_to_ms = lbm_to_ms     # LBM speed unit → m/s
+        self.domain_m  = domain_m       # (W_meters, H_meters) or None
         T, H, W = u_arr.shape
         self.T, self.H, self.W = T, H, W
 
         # Setup drone
-        self.sampler = DroneSampler(grid_size=H, obstacle_mask=obstacle_mask,
-                                    noise_std=0.02)
+        self.sampler = DroneSampler(grid_size=H, obstacle_mask=obstacle_mask)
         if drone_waypoints is None:
-            print("Planning street-following drone path (A*)...")
-            self.waypoints = self.sampler.make_street_path(n_waypoints=10, seed=0)
+            print("Planning traverse drone path (A*)...")
+            self.waypoints = self.sampler.make_traverse_path(seed=0)
             self._target_wps = getattr(self.sampler, '_last_targets', [])
         else:
             self.waypoints = drone_waypoints
@@ -346,6 +346,19 @@ class Dashboard:
                     self.ax_err, self.ax_traj):
             _ax.invert_xaxis()
 
+        # Meter axis labels: convert pixel tick positions to physical meters
+        if self.domain_m is not None:
+            W_m, H_m = self.domain_m
+            _W, _H = self.W, self.H
+            m_fmt_x = FuncFormatter(lambda x, _: f'{x * W_m / _W:.1f}')
+            m_fmt_y = FuncFormatter(lambda y, _: f'{y * H_m / _H:.1f}')
+            for _ax in (self.ax_gt, self.ax_pred, self.ax_uncert,
+                        self.ax_err, self.ax_traj):
+                _ax.xaxis.set_major_formatter(m_fmt_x)
+                _ax.yaxis.set_major_formatter(m_fmt_y)
+                _ax.set_xlabel('Z (m)', color=SUBTEXT, fontsize=7)
+                _ax.set_ylabel('X (m)', color=SUBTEXT, fontsize=7)
+
         # Status text
         self.status_text = self.fig.text(
             0.5, 0.02, '', ha='center', color=SUBTEXT,
@@ -419,8 +432,14 @@ class Dashboard:
         xi_i = int(np.clip(xi, 0, self.W-1))
         yi_i = int(np.clip(yi, 0, self.H-1))
         if not self.mask[yi_i, xi_i]:
-            u_sample = self.u_arr[t, yi_i, xi_i] + np.random.normal(0, 0.02)
-            v_sample = self.v_arr[t, yi_i, xi_i] + np.random.normal(0, 0.02)
+            u_t = self.u_arr[t, yi_i, xi_i]
+            v_t = self.v_arr[t, yi_i, xi_i]
+            spd_t = np.sqrt(u_t**2 + v_t**2)
+            ang_t = np.arctan2(v_t, u_t)
+            spd_n = max(0.0, spd_t + np.random.normal(0, self.sampler.noise_speed_std))
+            ang_n = ang_t + np.deg2rad(np.random.normal(0, self.sampler.noise_angle_std))
+            u_sample = spd_n * np.cos(ang_n)
+            v_sample = spd_n * np.sin(ang_n)
             self.obs_buffer.append({'x': xi, 'y': yi, 'u': u_sample, 'v': v_sample})
 
         # Get prediction (every 5 frames to save compute)
@@ -505,9 +524,15 @@ class Dashboard:
             self.ax_metrics.relim()
             self.ax_metrics.autoscale_view()
 
+            if self.domain_m is not None:
+                W_m, H_m = self.domain_m
+                drone_pos = (f'({xi * W_m / self.W:.1f}m,'
+                             f' {yi * H_m / self.H:.1f}m)')
+            else:
+                drone_pos = f'({xi:.0f}, {yi:.0f})'
             self.status_text.set_text(
                 f'Timestep: {t:3d}/{self.T-1}  |  '
-                f'Drone: ({xi:.0f}, {yi:.0f})  |  '
+                f'Drone: {drone_pos}  |  '
                 f'RMSE: {rmse:.4f}  |  MAE: {mae:.4f}  |  '
                 f'Mode: {"Model" if self.model else "Persistence"}')
 

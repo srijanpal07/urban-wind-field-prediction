@@ -19,14 +19,16 @@ class DroneSampler:
     grid_size      : int, domain grid resolution
     obstacle_mask  : bool array [H, W], True = solid (drone avoids these)
     sample_freq    : float, samples per timestep
-    noise_std      : float, std of Gaussian noise on u/v (in m/s units)
+    noise_speed_std : float, speed noise std in LBM units (≈ 0.5 m/s at lbm_to_ms=62.5)
+    noise_angle_std : float, direction noise std in degrees (default ±10°)
     """
 
     def __init__(self, grid_size: int = 128, obstacle_mask: np.ndarray = None,
-                 noise_std: float = 0.05):
+                 noise_speed_std: float = 0.008, noise_angle_std: float = 10.0):
         self.G = grid_size
         self.obstacle_mask = obstacle_mask
-        self.noise_std = noise_std
+        self.noise_speed_std = noise_speed_std  # LBM units (~0.5 m/s at lbm_to_ms=62.5)
+        self.noise_angle_std = noise_angle_std  # degrees
 
     def make_waypoints(self, n_waypoints: int = 6, seed: int = 0,
                        margin: float = 0.1):
@@ -129,6 +131,36 @@ class DroneSampler:
 
         return all_pts
 
+    def make_traverse_path(self, margin: float = 0.1, seed: int = 0,
+                           clearance: int = 2):
+        """
+        Generate a single left-to-right traverse using A*.
+        Starts at the low-column edge (array-left / display-right with invert_xaxis)
+        and ends at the high-column edge, at randomly chosen free-space rows.
+        No loops by construction.
+        """
+        rng = np.random.default_rng(seed)
+        G = self.G
+        lo = int(margin * G)
+        hi = int((1 - margin) * G)
+
+        def pick_free_row(col):
+            if self.obstacle_mask is not None:
+                free = [r for r in range(lo, hi) if not self.obstacle_mask[r, col]]
+            else:
+                free = list(range(lo, hi))
+            candidates = free if free else list(range(lo, hi))
+            return int(rng.choice(candidates))
+
+        row_start = pick_free_row(lo)
+        row_end   = pick_free_row(hi)
+
+        path = self._astar((row_start, lo), (row_end, hi), clearance)
+        waypoints = [(float(rc[1]), float(rc[0])) for rc in path]  # (col,row) → (x,y)
+        self._last_targets = [(float(lo), float(row_start)),
+                              (float(hi), float(row_end))]
+        return waypoints
+
     def make_lawnmower_path(self, n_passes: int = 4, margin: float = 0.15):
         """
         Generate a lawnmower survey path (parallel horizontal sweeps).
@@ -220,8 +252,12 @@ class DroneSampler:
 
             u_true[i] = u_i
             v_true[i] = v_i
-            u_obs[i] = u_i + np.random.normal(0, self.noise_std)
-            v_obs[i] = v_i + np.random.normal(0, self.noise_std)
+            speed_true = np.sqrt(u_i**2 + v_i**2)
+            angle_true = np.arctan2(v_i, u_i)
+            speed_noisy = max(0.0, speed_true + np.random.normal(0, self.noise_speed_std))
+            angle_noisy = angle_true + np.deg2rad(np.random.normal(0, self.noise_angle_std))
+            u_obs[i] = speed_noisy * np.cos(angle_noisy)
+            v_obs[i] = speed_noisy * np.sin(angle_noisy)
 
         return dict(x=x_path, y=y_path, t=t_indices,
                     u_obs=u_obs, v_obs=v_obs,
@@ -236,35 +272,42 @@ class DroneSampler:
           obs_mask     : [H, W] float, confidence weight per cell
         """
         H = W = grid_size
-        u_grid = np.zeros((H, W))
-        v_grid = np.zeros((H, W))
-        w_grid = np.zeros((H, W))
+        xs = np.asarray(obs['x'],     dtype=np.float32)
+        ys = np.asarray(obs['y'],     dtype=np.float32)
+        us = np.asarray(obs['u_obs'], dtype=np.float32)
+        vs = np.asarray(obs['v_obs'], dtype=np.float32)
 
-        for i in range(len(obs['x'])):
-            xi = obs['x'][i]
-            yi = obs['y'][i]
-            ui = obs['u_obs'][i]
-            vi = obs['v_obs'][i]
-            if np.isnan(ui) or np.isnan(vi):
-                continue
+        valid = ~(np.isnan(us) | np.isnan(vs))
+        if not valid.any():
+            return np.zeros((H, W)), np.zeros((H, W)), np.zeros((H, W))
+        xs, ys, us, vs = xs[valid], ys[valid], us[valid], vs[valid]
 
-            # Gaussian splat radius
-            x0 = max(0, int(xi - 3*sigma))
-            x1 = min(W, int(xi + 3*sigma) + 1)
-            y0 = max(0, int(yi - 3*sigma))
-            y1 = min(H, int(yi + 3*sigma) + 1)
+        u_grid = np.zeros((H, W), dtype=np.float32)
+        v_grid = np.zeros((H, W), dtype=np.float32)
+        w_grid = np.zeros((H, W), dtype=np.float32)
 
-            for gy in range(y0, y1):
-                for gx in range(x0, x1):
-                    d2 = (gx - xi)**2 + (gy - yi)**2
-                    w = np.exp(-d2 / (2 * sigma**2))
-                    u_grid[gy, gx] += w * ui
-                    v_grid[gy, gx] += w * vi
-                    w_grid[gy, gx] += w
+        r       = int(np.ceil(3.0 * sigma))
+        inv_2s2 = np.float32(0.5 / sigma**2)
+        gx_all  = np.arange(W, dtype=np.float32)
+        gy_all  = np.arange(H, dtype=np.float32)
 
-        mask = w_grid > 1e-6
-        u_grid[mask] /= w_grid[mask]
-        v_grid[mask] /= w_grid[mask]
-        w_grid_norm = np.clip(w_grid / (w_grid.max() + 1e-10), 0, 1)
+        for i in range(len(xs)):
+            x0 = max(0, int(xs[i]) - r);  x1 = min(W, int(xs[i]) + r + 1)
+            y0 = max(0, int(ys[i]) - r);  y1 = min(H, int(ys[i]) + r + 1)
 
-        return u_grid, v_grid, w_grid_norm
+            px = gx_all[x0:x1]   # [w_patch]
+            py = gy_all[y0:y1]   # [h_patch]
+            # Vectorized 2-D Gaussian over the patch — no inner Python loops
+            d2 = (px[None, :] - xs[i])**2 + (py[:, None] - ys[i])**2  # [h, w]
+            w  = np.exp(-d2 * inv_2s2)
+
+            u_grid[y0:y1, x0:x1] += w * us[i]
+            v_grid[y0:y1, x0:x1] += w * vs[i]
+            w_grid[y0:y1, x0:x1] += w
+
+        nz = w_grid > 1e-6
+        u_grid[nz] /= w_grid[nz]
+        v_grid[nz] /= w_grid[nz]
+        w_norm = np.clip(w_grid / (w_grid.max() + 1e-10), 0.0, 1.0)
+
+        return u_grid, v_grid, w_norm

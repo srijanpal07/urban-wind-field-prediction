@@ -1,6 +1,7 @@
 """
-Training script for WindFNO
-Trains on LBM-generated wind field data with synthetic drone observations.
+Training module for WindFNO.
+Trains on multi-condition LBM data with synthetic drone observations.
+Call via train_model.py (multi-condition) or run_pipeline.py (single condition).
 """
 
 import torch
@@ -17,40 +18,45 @@ from .drone_sampler import DroneSampler
 class WindDataset(Dataset):
     """
     Dataset of (input, target) pairs for wind prediction.
+    Samples randomly across N wind conditions (angle × speed combinations).
+
     input  : [6, H, W] - geometry + sparse observations at time t
     target : [2, H, W] - dense u, v at time t+horizon
     """
-    def __init__(self, u_series, v_series, obstacle_mask,
+    def __init__(self, u_all, v_all, obstacle_mask,
                  drone_sampler: DroneSampler, waypoints,
-                 horizon: int = 10, n_samples: int = 500,
-                 obs_window: int = 20):
-        self.u = u_series   # [T, H, W]
-        self.v = v_series
+                 horizon: int = 10, n_samples: int = 1000,
+                 obs_window: int = 15):
+        # u_all, v_all: [N, T, H, W]
+        self.u_all = u_all
+        self.v_all = v_all
         self.mask = obstacle_mask
         self.sampler = drone_sampler
         self.waypoints = waypoints
         self.horizon = horizon
         self.n_samples = n_samples
         self.obs_window = obs_window
-        T, H, W = u_series.shape
-        self.T = T
-        self.H = H
-        self.W = W
-        self.G = H
+        self.N, self.T, self.H, self.W = u_all.shape
+        self.G = self.H
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
         rng = np.random.default_rng(idx)
+
+        # Pick a random wind condition
+        cond_idx = int(rng.integers(0, self.N))
+        u_series = self.u_all[cond_idx]   # [T, H, W]
+        v_series = self.v_all[cond_idx]
         T = self.T
 
         # Random start time (ensure we have room for horizon)
         t0 = rng.integers(0, T - self.horizon - self.obs_window)
         t_target = t0 + self.obs_window + self.horizon
 
-        # Simulate drone trajectory over observation window
-        total_steps = self.obs_window * 3
+        # Simulate drone trajectory: 80 samples ≈ 10 Hz × 8 s traverse
+        total_steps = 80
         x_path, y_path = self.sampler.interpolate_path(self.waypoints, total_steps)
 
         # Add small random jitter to path for diversity
@@ -63,7 +69,7 @@ class WindDataset(Dataset):
         t_indices = np.linspace(t0, t0 + self.obs_window - 1, total_steps).astype(int)
 
         obs = self.sampler.sample_field(
-            self.u, self.v, x_path, y_path, t_indices)
+            u_series, v_series, x_path, y_path, t_indices)
 
         obs_u_grid, obs_v_grid, obs_confidence = self.sampler.obs_to_grid(
             obs, self.G, sigma=3.0)
@@ -83,46 +89,52 @@ class WindDataset(Dataset):
             yg.astype(np.float32)
         ], axis=0)  # [6, H, W]
 
-        # Target: dense wind field at t_target (zero out solid cells)
+        # Target: dense wind field at t_target from this condition
         y_out = np.stack([
-            self.u[t_target].astype(np.float32),
-            self.v[t_target].astype(np.float32)
+            u_series[t_target].astype(np.float32),
+            v_series[t_target].astype(np.float32)
         ], axis=0)  # [2, H, W]
         y_out[:, self.mask] = 0.0
 
         return torch.tensor(x_in), torch.tensor(y_out)
 
 
-def train(u_series, v_series, obstacle_mask, save_path='wind_fno.pth',
-          grid_size=128, n_epochs=50, batch_size=8, lr=1e-3,
+def train(u_all, v_all, obstacle_mask, save_path='outputs/wind_fno.pth',
+          grid_size=256, n_epochs=50, batch_size=8, lr=1e-3,
           horizon=10, device='cuda'):
     """
-    Train WindFNO model on LBM wind field data.
+    Train WindFNO on multi-condition LBM data.
+    u_all, v_all: [N, T, H, W] — N wind conditions stacked along axis 0.
     """
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     print(f"Training on: {device}")
 
-    # Setup drone sampler and path
-    sampler = DroneSampler(grid_size=grid_size,
-                           obstacle_mask=obstacle_mask,
-                           noise_std=0.02)
-    waypoints = sampler.make_street_path(n_waypoints=8, seed=42)
+    N, _, H, _ = u_all.shape
+    grid_size = H   # always use actual data shape; ignore any passed-in value
+    print(f"Conditions: {N}  |  Grid: {grid_size}×{grid_size}")
 
-    # Dataset
-    dataset = WindDataset(u_series, v_series, obstacle_mask,
+    # Setup drone sampler and path (polar noise; traverse from edge to edge)
+    sampler = DroneSampler(grid_size=grid_size, obstacle_mask=obstacle_mask)
+    waypoints = sampler.make_traverse_path(seed=42)
+
+    # Scale sample count with number of conditions
+    n_samples = max(600, 30 * N)
+    dataset = WindDataset(u_all, v_all, obstacle_mask,
                           sampler, waypoints, horizon=horizon,
-                          n_samples=600, obs_window=15)
+                          n_samples=n_samples, obs_window=30)
 
-    n_val = 60
+    n_val = max(60, n_samples // 10)
     n_train = len(dataset) - n_val
     train_ds, val_ds = torch.utils.data.random_split(
         dataset, [n_train, n_val],
         generator=torch.Generator().manual_seed(42))
 
     train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              shuffle=True, num_workers=0)
+                              shuffle=True,  num_workers=4,
+                              persistent_workers=True, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size,
-                              shuffle=False, num_workers=0)
+                              shuffle=False, num_workers=2,
+                              persistent_workers=True, pin_memory=True)
 
     # Model
     modes = max(20, grid_size // 8)

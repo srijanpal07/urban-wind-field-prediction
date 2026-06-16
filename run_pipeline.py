@@ -40,7 +40,7 @@ def main():
                         help='If set, linearly rotate wind direction to this angle (degrees) '
                              'over the collection window. E.g. --angle 0 --angle-end 90')
     parser.add_argument('--epochs',     type=int,   default=50)
-    parser.add_argument('--batch',      type=int,   default=8)
+    parser.add_argument('--batch',      type=int,   default=32)
     parser.add_argument('--lr',         type=float, default=1e-3)
     parser.add_argument('--horizon',    type=int,   default=10)
     parser.add_argument('--device',     type=str,   default='cuda')
@@ -63,11 +63,14 @@ def main():
     # ── Step 1: Geometry ──────────────────────────────────────────────────
     from src.geometry import stl_to_obstacle_mask, make_synthetic_city
 
+    domain_m = None
     if args.stl and os.path.exists(args.stl):
         print(f"[1/4] Loading geometry from STL: {args.stl}")
         obstacle_mask, bounds = stl_to_obstacle_mask(
             args.stl, grid_size=args.grid,
             slice_height=args.slice_height)
+        domain_m = ((bounds['h0_max'] - bounds['h0_min']) / 1000.0,
+                    (bounds['h1_max'] - bounds['h1_min']) / 1000.0)
     else:
         if args.stl:
             print(f"[1/4] STL '{args.stl}' not found — using synthetic city")
@@ -130,8 +133,9 @@ def main():
         print(f"      Epochs: {args.epochs}  |  Batch: {args.batch}  |  "
               f"LR: {args.lr}  |  Horizon: {args.horizon}")
         from src.train import train
+        # Wrap single condition as [1, T, H, W] for the multi-condition API
         model, history = train(
-            u_arr, v_arr, obstacle_mask,
+            u_arr[np.newaxis], v_arr[np.newaxis], obstacle_mask,
             save_path=args.model,
             grid_size=args.grid,
             n_epochs=args.epochs,
@@ -192,7 +196,7 @@ def main():
     from src.visualize import Dashboard
     lbm_to_ms = args.ref_speed / abs(args.speed)
     dash = Dashboard(u_arr, v_arr, obstacle_mask, model=model, device=device,
-                     lbm_to_ms=lbm_to_ms)
+                     lbm_to_ms=lbm_to_ms, domain_m=domain_m)
     dash.run(interval=80, save_gif=args.save)
 
 
