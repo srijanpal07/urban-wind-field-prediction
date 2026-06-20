@@ -60,12 +60,17 @@ are unknown; only the drone readings are available.
 
 | Dataset | Angles | Speeds | Mode | File |
 |---------|--------|--------|------|------|
-| Training | 16 × every 22.5° → [0, 22.5, …, 337.5] | [0.02, 0.04, 0.08, 0.10] | transient | `data/lbm_multicond.npz` |
-| Test | 8 × midpoints → [11.25, 56.25, …, 326.25] | [0.03, 0.06] | steady-state | `data/lbm_test.npz` |
+| Training | 32 × every 11.25° → [0, 11.25, …, 348.75] | [0.02, 0.04, 0.08, 0.10] | transient | `data/cache/lbm_transient_*.npz` (lazy) |
+| Test | 8 × midpoints → [5.625, 50.625, …, 320.625] | [0.03, 0.06] | steady-state | `data/lbm_test.npz` |
 
-Test angles are exactly midway between every other pair of training angles; test
-speeds sit between training speeds. Neither appears during training — a clean
+Test angles sit midway between every 4th pair of training angles (5.625° offset);
+test speeds sit between training speeds. Neither appears during training — a clean
 interpolation benchmark.
+
+Training data is **not** combined into a single large file. `generate_data.py`
+writes compressed per-condition npz files to `data/cache/` (~80 MB each, ~10 GB
+total for 128 conditions). `WindDataset` lazy-loads them on demand per DataLoader
+worker, so peak RAM is one condition per worker (~300 MB) rather than 40 GB.
 
 Use `--test-data data/lbm_test.npz` with `evaluate.py` to run the held-out
 evaluation instead of random on-the-fly LBM conditions.
@@ -79,7 +84,7 @@ per-condition formula `ref_speed / abs(speed)` for its single-condition display.
 
 ### File Map
 ```
-generate_data.py       ← Step 1: run LBM for 64 train + 16 test conditions
+generate_data.py       ← Step 1: run LBM for 128 train + 16 test conditions
 train_model.py         ← Step 2: train WindFNO on multi-condition dataset
 infer.py               ← Step 3: infer at random or specified wind condition
 evaluate.py            ← Step 4: benchmark on random or held-out conditions
@@ -142,9 +147,9 @@ python run_pipeline.py --stl data/city_model.STL
 ### Key Defaults
 | Script              | Argument          | Default                                     | Notes                                         |
 |---------------------|-------------------|---------------------------------------------|-----------------------------------------------|
-| generate_data.py    | `--angles`        | 0 22.5 45 … 337.5 (16 values)              | Training angles, every 22.5°                  |
+| generate_data.py    | `--angles`        | 0 11.25 22.5 … 348.75 (32 values)          | Training angles, every 11.25°                 |
 | generate_data.py    | `--speeds`        | 0.02 0.04 0.08 0.10                         | 4 LBM speeds → 1.25–6.25 m/s                 |
-| generate_data.py    | `--test-angles`   | 11.25 56.25 … 326.25 (8 values)            | Held-out angles (midpoints, unseen in train)  |
+| generate_data.py    | `--test-angles`   | 5.625 50.625 … 320.625 (8 values)          | Held-out angles (5.625° offset, unseen)       |
 | generate_data.py    | `--test-speeds`   | 0.03 0.06                                   | Held-out speeds (between train speeds)        |
 | generate_data.py    | `--warmup`        | 1000                                        | LBM warmup steps per condition                |
 | generate_data.py    | `--steps`         | 150                                         | Snapshots collected per condition             |

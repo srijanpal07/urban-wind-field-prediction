@@ -207,6 +207,9 @@ class WindFNO(nn.Module):
         )
 
     def forward(self, x):
+        # Channel 0 is the geometry mask (1=building) — used for hard BC enforcement
+        geom = x[:, 0:1]
+
         x = self.lift(x)
         skip = None
         for i, layer in enumerate(self.fno_layers):
@@ -217,11 +220,15 @@ class WindFNO(nn.Module):
         x = torch.cat([x, skip], dim=1)
         out = self.project(x)
 
-        # Split outputs: mean u/v + log-variance for uncertainty
-        u_pred     = out[:, 0:1]
-        v_pred     = out[:, 1:2]
-        log_var_u  = out[:, 2:3]
-        log_var_v  = out[:, 3:4]
+        u_pred    = out[:, 0:1]
+        v_pred    = out[:, 1:2]
+        log_var_u = out[:, 2:3]
+        log_var_v = out[:, 3:4]
+
+        # Hard no-slip: zero velocity inside buildings (physics BC, not a penalty)
+        fluid = 1.0 - geom
+        u_pred = u_pred * fluid
+        v_pred = v_pred * fluid
 
         sigma_u = torch.exp(0.5 * log_var_u.clamp(-6, 6))
         sigma_v = torch.exp(0.5 * log_var_v.clamp(-6, 6))
@@ -256,24 +263,32 @@ def prepare_input(obs_u: np.ndarray, obs_v: np.ndarray,
 
 def nll_loss(u_pred, v_pred, sigma_u, sigma_v, u_true, v_true, solid_mask):
     """
-    Negative log-likelihood loss (Gaussian) + physics regularization.
-    Only computed on fluid cells (not inside buildings).
+    Loss = NLL (Gaussian) + MSE anchor + divergence regularization.
+
+    The MSE term prevents the model from gaming NLL by inflating sigma —
+    a known failure mode where the model predicts the mean everywhere and
+    learns large sigma to absorb errors, producing uniform output fields.
+    lambda_mse=1.0 keeps the anchor at the same scale as the NLL term.
     """
     fluid_t = (~solid_mask).float().to(u_pred.device).unsqueeze(0).unsqueeze(0)
 
-    # NLL loss: -log p(y | mu, sigma)
+    # NLL: -log p(y | mu, sigma) over fluid cells
     nll_u = (torch.log(sigma_u + 1e-6) +
              0.5 * ((u_true - u_pred) / (sigma_u + 1e-6))**2) * fluid_t
     nll_v = (torch.log(sigma_v + 1e-6) +
              0.5 * ((v_true - v_pred) / (sigma_v + 1e-6))**2) * fluid_t
+    nll = (nll_u + nll_v).mean()
 
-    loss = (nll_u + nll_v).mean()
+    # MSE anchor: forces accurate mean predictions regardless of sigma
+    mse = (((u_pred - u_true)**2 + (v_pred - v_true)**2) * fluid_t).mean()
 
     # Divergence-free regularization (incompressible flow: du/dx + dv/dy = 0)
-    du_dx = u_pred[:, :, :, 1:] - u_pred[:, :, :, :-1]
-    dv_dy = v_pred[:, :, 1:, :] - v_pred[:, :, :-1, :]
-    min_size = min(du_dx.shape[2], dv_dy.shape[2]), min(du_dx.shape[3], dv_dy.shape[3])
-    div = du_dx[:, :, :min_size[0], :min_size[1]] + dv_dy[:, :, :min_size[0], :min_size[1]]
+    # Only over fluid cells — buildings are masked out before computing divergence
+    du_dx = (u_pred[:, :, :, 1:] - u_pred[:, :, :, :-1]) * fluid_t[:, :, :, :-1]
+    dv_dy = (v_pred[:, :, 1:, :] - v_pred[:, :, :-1, :]) * fluid_t[:, :, :-1, :]
+    min_h = min(du_dx.shape[2], dv_dy.shape[2])
+    min_w = min(du_dx.shape[3], dv_dy.shape[3])
+    div = du_dx[:, :, :min_h, :min_w] + dv_dy[:, :, :min_h, :min_w]
     div_loss = (div**2).mean()
 
-    return loss + 0.01 * div_loss
+    return nll + 1.0 * mse + 0.5 * div_loss
