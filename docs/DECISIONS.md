@@ -184,6 +184,109 @@ Fix: pass `-u` instead of `u` to `set_UVC()`. This makes the arrow appear
 leftward on screen, correctly indicating where the wind is going. The V component
 does not need negation — `origin='lower'` is handled correctly by quiver.
 
+---
+
+## Phase 2 Design Decisions (June 2026)
+
+### Why flow matching instead of DDPM for Phase 2?
+
+DDPM (the original Phase 2 plan) trains a noise prediction network and samples
+via a 100–1000 step reverse diffusion chain. Flow matching instead learns a
+velocity field that transports noise to data along a straight-line path:
+
+    x_t = (1−t)·x_noise + t·x_data
+    Loss = E[‖v_θ(x_t, t, c) − (x_data − x_noise)‖²]
+
+Straight paths are easier to integrate numerically → 10–20 ODE steps suffice
+vs 100–1000 for DDPM. For N=20 ensemble samples at each waypoint with a 30–60s
+inference budget, this difference is critical.
+
+Bayesian conditioning (DPS-style guidance) transfers identically from DDPM to
+flow matching — the same gradient guidance logic applies to the ODE integrator
+instead of the SDE denoiser. No architectural change needed.
+
+### Why temporal forecasting (5-min obs → 5-min forecast) not snapshot prediction?
+
+Phase 1 predicts a single future snapshot (one field at t+horizon). For drone
+path planning, the planner needs to know how the wind evolves *during* the next
+leg, not just at the start of it. The Phase 2 model outputs a full (T_out, H, W)
+field sequence — the drone can compute risk against wind along its trajectory
+at every future timestep, not just at t=0.
+
+### Why DPS (Bayesian posterior sampling) for observation conditioning?
+
+DPS conditions the generative model on drone observations at inference time
+without any retraining per route:
+
+    v_guided = v_θ(x_s, s, c_geo) − ρ·∇_{x_s}‖obs − H(x̂_1)‖²
+
+H is the forward operator that extracts the model's predicted wind at the
+drone's actual trajectory positions. The gradient is computed via autodiff
+through H and the model. This means any drone path can be used as conditioning
+input — no need to retrain when the route changes or when testing new paths.
+
+### Why hard Leray projection + obstacle mask instead of soft physics losses?
+
+Phase 1 uses a soft divergence penalty (λ·‖∇·u‖²) as a regularizer. For the
+ensemble output in Phase 2, each sample must satisfy physics *exactly*, because
+downstream exceedance probability calculations assume physically valid fields.
+
+- Leray projection (2D FFT): u ← u − ∇(∇⁻²·∇·u) gives exact ∇·u = 0 in one
+  pass. Cost is negligible (two FFTs per sample).
+- Obstacle mask: multiply velocity channels by the fluid mask (0 inside buildings).
+  Exact no-slip at zero cost. No soft loss can guarantee this.
+
+Soft losses only push the prediction *toward* physics; hard constraints guarantee
+it. Since projection and masking are applied post-generation, they don't interact
+with the training objective.
+
+### Why keep LBM for Phase 2 (not switch to URANS/LES)?
+
+LES is inherently 3D — it has no well-defined 2D formulation. URANS requires a
+separate CFD solver (OpenFOAM), mesh generation, turbulence model tuning, and
+wall-clock days per run at scale. This is a major infrastructure change.
+
+The existing PyTorch LBM runs on our GPU, takes minutes per condition, and
+already produces physically consistent transient unsteady flow with vortex
+shedding and turbulent-like fluctuations. It is sufficient to validate the Phase
+2 architecture. OpenFOAM data replaces LBM in Phase 4.
+
+### Why pixel space (not latent space) for Phase 2 start?
+
+At 256×256 × T_out~30, each training sample is ~18M values. A spatiotemporal
+U-Net operating in pixel space is large but within the 32GB VRAM budget of the
+RTX 5000 Ada for reasonable batch sizes. Adding a VAE (latent space) introduces
+a second model to train and validate.
+
+Pixel space is simpler and avoids the two-stage training complexity. Latent
+space is added only if memory or inference benchmarking shows it is needed.
+
+### Why GNN trajectory encoder is deferred?
+
+The current grid-splatting approach (obs_u, obs_v, confidence channels) places
+drone observations at their grid cell locations and is already working in Phase 1.
+A GNN encoder handles irregular path geometry more naturally but adds a new model
+component and training dependency. The added complexity is only justified if
+ablation studies show the grid splatting is the accuracy bottleneck.
+
+### Why 15-minute wind stability matters for training design?
+
+Atmospheric boundary conditions (wind speed and direction) are approximately
+stable for ~15-minute windows in the operational environment. The full training
+window (5-min obs + 5-min forecast = 10 min) fits within one stable period.
+
+This means:
+- The model is never asked to handle BC changes during a prediction window
+- Each LBM run at a fixed (angle, speed) gives many clean (obs, forecast) pairs
+  — the simplest possible training data structure
+- Turbulent fluctuations (the model's primary uncertainty source) occur on top
+  of a stable mean, making the forecast problem well-conditioned
+
+If BC changes become relevant (e.g. wind shifts at 10-min scale), training data
+and the model framing would need to change. For now, stable BCs are assumed.
+
+---
+
 ## Why m/s labels on colorbars?
 
 LBM units (dimensionless speeds 0.0–0.25) are not immediately interpretable

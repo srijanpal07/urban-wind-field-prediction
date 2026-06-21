@@ -44,7 +44,7 @@ Timing contract:
 
 ## Current Implementation (Phase 1 — Working Prototype)
 
-Phase 1 trains across 64 wind conditions (16 angles × 4 LBM speeds) so the
+Phase 1 trains across 128 wind conditions (32 angles × 4 LBM speeds) so the
 model generalises over the full 360° direction range and ~1–6 m/s speed range.
 The pipeline is split into four standalone scripts.
 
@@ -104,12 +104,12 @@ data/
   city_model.STL       ← Real 1:40 scale city model (Y-up)
   obstacle_mask.npy    ← Cached rasterized mask
   cache/               ← Per-condition LBM cache (lbm_{mode}_a{angle}_s{speed}.npz)
-  lbm_multicond.npz    ← Training dataset [N,T,H,W] (64 conditions)
   lbm_test.npz         ← Held-out test dataset [N,T,H,W] (16 unseen conditions)
 outputs/
   wind_fno.pth         ← Best trained checkpoint (includes modes + grid_size)
   wind_fno_history.png ← Training curve from train_model.py
   wind_dashboard.gif   ← Last saved animation
+  eval_results.json    ← Saved by evaluate.py --save (per-condition metrics + summary)
 ```
 
 ### Recommended Workflow
@@ -119,8 +119,11 @@ pip install -r requirements.txt
 # 1. Generate train + test data (64 + 16 conditions; ~45-90 min on GPU at 512×512):
 python generate_data.py --stl data/city_model.STL --grid 512 --warmup 2000
 
-# 2. Train (50 epochs default):
+# 2. Train (100 epochs default):
 python train_model.py
+
+# 2b. Resume training from a saved checkpoint (--epochs is total, not additional):
+python train_model.py --resume --epochs 200
 
 # 3. Infer at a random wind condition:
 python infer.py --stl data/city_model.STL
@@ -136,6 +139,9 @@ python evaluate.py --stl data/city_model.STL
 
 # 4b. Rigorous held-out evaluation (16 unseen angles/speeds, no LBM re-run needed):
 python evaluate.py --stl data/city_model.STL --test-data data/lbm_test.npz
+
+# 4c. Save evaluation results to JSON:
+python evaluate.py --stl data/city_model.STL --test-data data/lbm_test.npz --save outputs/eval_results.json
 
 # Skip test data generation (training data only):
 python generate_data.py --stl data/city_model.STL --skip-test
@@ -155,14 +161,35 @@ python run_pipeline.py --stl data/city_model.STL
 | generate_data.py    | `--steps`         | 150                                         | Snapshots collected per condition             |
 | generate_data.py    | `--test-output`   | data/lbm_test.npz                           | Path for held-out test dataset                |
 | generate_data.py    | `--skip-test`     | False                                       | Skip test set generation                      |
-| train_model.py      | `--epochs`        | 50                                          | Training epochs                               |
+| train_model.py      | `--epochs`        | 100                                         | Training epochs (total when using --resume)   |
 | train_model.py      | `--batch`         | 32                                          | Batch size                                    |
+| train_model.py      | `--resume`        | False                                       | Resume from --model checkpoint                |
 | infer.py            | `--angle`         | random [0, 360)                             | Printed to stdout for reproducibility         |
 | infer.py            | `--speed`         | random [0.02, 0.10]                         | Printed to stdout                             |
 | infer.py            | `--ref-speed`     | 5.0                                         | m/s corresponding to LBM speed 0.08          |
 | evaluate.py         | `--n`             | 10                                          | Random conditions (ignored if --test-data)    |
 | evaluate.py         | `--test-data`     | None                                        | Path to lbm_test.npz for held-out eval       |
 | evaluate.py         | `--seed`          | 42                                          | RNG seed for drone paths + random conditions  |
+| evaluate.py         | `--save`          | None                                        | Save per-condition JSON to this path          |
+
+## Benchmark Results (Phase 1)
+
+Held-out test set: 16 conditions (8 angles × 2 speeds, all unseen during training).
+Grid: 512×512, 128 training conditions, 200 epochs, batch=32.
+
+| Checkpoint | Epochs | Vec RMSE (m/s) | Speed MAE (m/s) | Dir Error |
+|---|---|---|---|---|
+| Run 1 (64 cond, fixed val rng) | 50 | 3.39 | 2.20 | 72.3° |
+| Run 2 (128 cond, val pinned, cond-shuffle) | 200 | **2.75** | **1.87** | **43.4°** |
+
+Per-condition breakdown (Run 2, 200 epochs):
+- Best: 320.62° at 1.87 m/s → 17.7° direction error
+- Worst: 230.62° at 1.87 m/s → 72.8° direction error
+- Low-speed (1.87 m/s) conditions harder: SNR low relative to 0.5 m/s sensor noise
+- High-speed (3.75 m/s) conditions: 25–61° direction error
+
+Known ceiling at this configuration: val loss plateaued ~epoch 150 (-4.45 NLL).
+Next lever: increase `total_steps` (drone observations) from 80 → 160 in `src/train.py`.
 
 ## Hardware
 - GPU: NVIDIA RTX 5000 Ada Generation, 32GB VRAM

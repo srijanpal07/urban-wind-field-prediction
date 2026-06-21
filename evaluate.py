@@ -167,6 +167,36 @@ def _print_summary(results, seed_label, lbm_to_ms):
     row('Direction error (°)',  dir_errs,   ' ')
 
 
+def _maybe_save(results, args, lbm_to_ms, mode):
+    if not args.save:
+        return
+    import json, datetime
+    vec_rmses  = [r['vector_rmse'] for r in results if not np.isnan(r['vector_rmse'])]
+    speed_maes = [r['speed_mae']   for r in results if not np.isnan(r['speed_mae'])]
+    dir_errs   = [r['dir_error']   for r in results if not np.isnan(r['dir_error'])]
+    payload = {
+        'timestamp':   datetime.datetime.now().isoformat(timespec='seconds'),
+        'model':       args.model,
+        'mode':        mode,
+        'test_data':   args.test_data,
+        'seed':        args.seed,
+        'lbm_to_ms':  lbm_to_ms,
+        'summary': {
+            'n_conditions':  len(results),
+            'vec_rmse_mean': float(np.mean(vec_rmses))  if vec_rmses  else None,
+            'vec_rmse_std':  float(np.std(vec_rmses))   if vec_rmses  else None,
+            'speed_mae_mean':float(np.mean(speed_maes)) if speed_maes else None,
+            'dir_error_mean':float(np.mean(dir_errs))   if dir_errs   else None,
+            'dir_error_std': float(np.std(dir_errs))    if dir_errs   else None,
+        },
+        'per_condition': results,
+    }
+    os.makedirs(os.path.dirname(args.save) or '.', exist_ok=True)
+    with open(args.save, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"\nResults saved → {args.save}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Evaluate WindFNO across wind conditions')
     parser.add_argument('--stl',       type=str,   default=None)
@@ -188,6 +218,8 @@ def main():
     parser.add_argument('--horizon',   type=int,   default=10)
     parser.add_argument('--seed',      type=int,   default=42)
     parser.add_argument('--device',    type=str,   default='cuda')
+    parser.add_argument('--save',      type=str,   default=None,
+                        help='Save per-condition results as JSON (e.g. outputs/eval_results.json)')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -285,6 +317,7 @@ def main():
 
         print(SEP)
         _print_summary(results, f'held-out test, rng seed={args.seed}', lbm_to_ms)
+        _maybe_save(results, args, lbm_to_ms, mode='held-out-test')
 
     # ── Mode B: random on-the-fly evaluation ──────────────────────────────────
     else:
@@ -320,6 +353,7 @@ def main():
 
         print(SEP)
         _print_summary(results, f'seed={args.seed}', lbm_to_ms)
+        _maybe_save(results, args, lbm_to_ms, mode='random')
 
 
 if __name__ == '__main__':

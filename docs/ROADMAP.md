@@ -26,91 +26,180 @@ Status:
 
 ---
 
-## Phase 2: Latent Diffusion Model
+## Phase 2: Spatiotemporal Flow-Matching Forecast Model 🔜 NEXT
 
-Goal: Replace U-FNO with a diffusion model for richer probabilistic output.
-      Instead of a single mean + variance, get full posterior samples.
+Goal: Replace U-FNO with a flow-matching generative model that forecasts the
+      full 5-minute future wind field evolution from the past 5 minutes of
+      drone observations. Output is an ensemble of N plausible future field
+      sequences, not a single mean+variance snapshot.
 
-Why:
-  - Urban wind is multimodal near building corners (flow can go either way)
-  - A diffusion model samples from p(wind_field | observations, geometry)
-  - Each sample is a physically plausible full wind field
-  - Ensemble of samples → uncertainty + decision support for drone planning
+### Problem framing (precise)
 
-Architecture plan:
 ```
-  VAE Encoder:   wind field [2, H, W] → latent z [C, H/4, W/4]
+  Input:   obstacle_mask [H, W]                       (fixed geometry)
+           drone obs over past 5 min:
+             obs_u, obs_v, confidence [H, W]           (splatted to grid)
+             (same 6-channel format as Phase 1)
 
-  Diffusion:     score network = U-Net conditioned on
-                   - geometry embedding (CNN of obstacle mask)
-                   - observation embedding (FNO or PointNet of sparse obs)
-                   - time embedding (diffusion timestep t)
+  Output:  N ensemble samples of next-5-min field evolution
+             each sample: (u, v) [T_out, H, W]
+             T_out = number of saved timesteps in 5-min forecast window
 
-  VAE Decoder:   latent z → wind field [2, H, W]
-
-  Inference:     DDIM (50 steps, ~0.5s on RTX 5000 Ada)
-                 or Consistency Model (1–4 steps, ~50ms)
+  Online:  ensemble → path-conditioned exceedance probability → next leg
 ```
 
-Key references:
-  - Latent Diffusion Models (Rombach et al., 2022)
-  - Score-based generative models (Song et al., 2021)
-  - CorrDiff (NVIDIA, 2024) — diffusion for weather downscaling
+### Why this replaces the original VAE+DDPM plan
 
-Training data: same LBM-generated fields as Phase 1
-New requirement: need more timesteps (500+) for diffusion training diversity
+- **Temporal forecasting, not snapshot prediction**: the drone needs to plan
+  the next 5-min leg against how the wind *evolves*, not just what it looks
+  like now. Target is a (T_out, H, W) field sequence, not a single frame.
+- **Flow matching over DDPM**: straight-line ODE paths → 10–20 integration
+  steps vs 100–1000. Critical for 30–60s online inference budget per waypoint.
+  Same uncertainty quality; simpler training loss (no noise schedule to tune).
+- **No VAE needed yet**: pixel-space operation at 256×256 with T_out~30
+  timesteps is feasible on the RTX 5000 Ada (32 GB). Add latent space only
+  if memory benchmarking shows a bottleneck.
+
+### Key design decisions (June 2026)
+
+- **LBM data stays**: no URANS/LES. Existing 128-condition LBM cache is the
+  training foundation. OpenFOAM CFD arrives later (Phase 4).
+- **Sparse obs encoding unchanged**: grid splatting (obs_u, obs_v, confidence
+  channels) carries forward from Phase 1. GNN trajectory encoder is deferred.
+- **Hard physics constraints post-generation** (not soft losses):
+    - Leray projection: exact ∇·u = 0 (incompressibility) in 2D Fourier space
+    - Obstacle mask: zero velocity inside buildings (exact no-slip)
+- **15-minute wind stability**: atmospheric BCs are stable for ~15-min windows.
+  The 10-min window (5-min obs + 5-min forecast) fits entirely within one
+  stable period. The model never handles BC changes mid-window. This means
+  each LBM condition yields many clean (obs, forecast) pairs under a fixed BC.
+- **2D only**: no 3D extension in Phase 2. Single horizontal slice at fixed
+  altitude, same as Phase 1.
+
+### Architecture
+
+```
+Offline (trained once on LBM data):
+
+  Geometry encoder  obstacle_mask [H, W]
+  (small CNN)       → geometry_features [H, W, C_geo]
+                    injected at every scale of the U-Net
+
+  Spatiotemporal    Input: noisy interpolation x_t [T, H, W] (noise↔target)
+  U-Net backbone    Conditioning: geometry_features + obs channels
+    - 3D conv in early layers     (local spatiotemporal correlations)
+    - 2D spatial attention        (global flow structure, lower resolutions)
+    - 1D temporal attention       (flow evolution, full resolution)
+    - ODE timestep embedding t    (position in flow-matching process)
+  Output: predicted velocity field v_θ(x_t, t, c) [T, H, W]
+
+  Training loss (flow matching):
+    x_t = (1−t)·x_noise + t·x_target    (straight-line interpolation)
+    L = E[‖v_θ(x_t, t, c) − (x_target − x_noise)‖²]
+    where c = geometry channels + splatted drone observation channels
+
+Online inference at each waypoint (target: <60s for N=20 on RTX 5000 Ada):
+
+  1. Splat drone obs onto grid → obs_u, obs_v, confidence [H, W]
+  2. Generate N=20 ensemble samples (batched on GPU) via DPS-guided ODE:
+       x_0 ~ N(0, I)   (pure noise)
+       For each step s = 0 → 1 (20 steps):
+         v̂ = v_θ(x_s, s, c_geo)              model predicts velocity field
+         x̂_1 = x_s + (1−s)·v̂               estimated clean field
+         g_obs = ∇_{x_s}‖obs − H(x̂_1)‖²    DPS guidance (autodiff through H)
+         x_{s+ds} = x_s + ds·v̂ − ρ·g_obs   guided Euler step
+         (H is the grid-splatting operator extracting obs at drone positions)
+  3. Post-process each sample (hard constraints):
+       Leray projection:  u ← u − ∇(∇⁻²·∇·u)   (exact ∇·u = 0, 2D FFT)
+       Obstacle mask:     velocity = 0 inside buildings
+  4. For each candidate next-leg path, compute exceedance probability:
+       exceedance_prob[path] = fraction of samples where
+         max wind along path over 5 min > safety threshold
+  5. Return ensemble mean + exceedance probabilities to trajectory optimizer
+```
+
+### Training data requirements
+
+Current LBM cache has 150 snapshots per condition (~2–3 min simulated time).
+Need extension to extract enough non-overlapping 10-min (obs+forecast) pairs:
+- Target: 500+ snapshots per condition (~10–15 min simulated time per run)
+- Re-run generate_data.py with `--steps 500` (and `--warmup 2000` to keep it)
+
+### Key references
+
+- Conditional Neural Field Latent Diffusion (CoNFiLD) — Cornell, 2024
+  The DPS conditioning strategy (Bayesian posterior sampling via guided score)
+  is taken directly from this paper. Their F = sparse sensor masking operator;
+  our H = grid-splatting + path extraction operator. Same math, different F.
+- Flow Matching for Generative Modeling — Lipman et al., 2022
+- Rectified Flow — Liu et al., 2022
+- Diffusion Posterior Sampling (DPS) — Chung et al., 2022
 
 ### Phase 2 TODO
-- [ ] Build VAE for wind fields (encoder + decoder)
-- [ ] Train VAE, verify reconstruction quality
-- [ ] Build conditional score network (U-Net + cross-attention on obs)
-- [ ] Train diffusion model
-- [ ] Implement DDIM sampler
-- [ ] Update visualization: show multiple posterior samples
-- [ ] Compare: U-FNO (deterministic) vs diffusion (probabilistic)
+
+- [ ] Extend LBM runs: `--steps 500` per condition; rebuild data cache
+- [ ] Build spatiotemporal U-Net backbone (3D conv + 2D spatial + 1D temporal attention)
+- [ ] Implement flow-matching training loop (straight-line x_t, velocity loss)
+- [ ] Wire geometry conditioning: CNN encoder + channel concat at every U-Net scale
+- [ ] Implement DPS guidance at inference (autodiff through H operator)
+- [ ] Implement Leray projection post-processing (2D FFT)
+- [ ] Implement obstacle mask hard constraint post-processing
+- [ ] Batch N=20 ensemble samples on GPU; benchmark inference time vs 60s target
+- [ ] Implement path-conditioned exceedance probability risk metric
+- [ ] Update visualization: ensemble spread, mean field, risk overlay on candidate paths
+- [ ] Evaluate: compare U-FNO (deterministic snapshot) vs flow-matching (ensemble forecast)
 
 ---
 
-## Phase 3: World Model
+## Phase 3: Trajectory Optimizer + Active Sensing
 
-Goal: Learn a latent dynamics model of urban wind that the drone can query
-      and update as it flies.
+Goal: Close the loop between the Phase 2 generative model and the drone
+      flight planner. The drone actively chooses its next leg to minimize
+      risk and reduce forecast uncertainty.
 
 Concept:
 ```
-  State:  h_t = latent belief about current wind field
-
-  Dynamics:   h_{t+1} = f_dynamics(h_t, boundary_conditions_t)
-
-  Observation update:  h_t → h_t' = f_update(h_t, drone_obs_t)
-  (like a learned Kalman filter / particle filter in latent space)
-
-  Decoder:    h_t → wind_field_t  (dense 2D prediction + uncertainty)
+  At each waypoint:
+    ensemble of N future field sequences   (from Phase 2)
+         ↓
+    risk metric per candidate path         (exceedance probability)
+         ↓
+    trajectory optimizer                   (energy + risk tradeoff)
+         ↓
+    selected next leg A→B
+         ↓
+    drone flies, collects new observations
+         ↓
+    (loop back to Phase 2 inference)
 ```
 
-This enables:
-  1. Drone takes a measurement → updates latent state → better prediction
-  2. Model rolls out future states → drone can plan ahead
-  3. Adaptive trajectory: fly where uncertainty σ(x,y) is highest
-     (active sensing / informative path planning)
+Extensions beyond Phase 2:
+  1. Active sensing: steer the drone toward high-uncertainty regions
+     (maximise information gain on the next leg, not just minimise risk)
+  2. Multi-leg planning: optimise over K future legs, not just the next one
+  3. Latent dynamics: if Phase 2 ensemble is too slow for long-horizon planning,
+     learn a fast latent predictor on top of Phase 2's latent space
 
 Architecture options:
-  - RSSM (Recurrent State Space Model) — from DreamerV3
-  - Transformer world model — from Genie / DIAMOND
-  - Neural ODE / flow matching — continuous-time dynamics
+  - Energy + risk penalty optimizer (simple, Phase 3 start):
+      min: travel_cost(path) + λ · exceedance_prob(path)
+      subject to: avoids obstacles, connects waypoints
+  - RSSM / Transformer world model (if multi-leg rollout is needed):
+      roll out future states in latent space without re-running full diffusion
+  - Informative path planning (active sensing):
+      maximise ensemble variance reduction along candidate paths
 
 Key references:
-  - DreamerV3 (Hafner et al., 2023)
-  - DIAMOND (Alonso et al., 2024)
-  - Neural Process family (Garnelo et al.) — for observation conditioning
+  - DreamerV3 (Hafner et al., 2023) — RSSM latent dynamics
+  - DIAMOND (Alonso et al., 2024) — Transformer world model
+  - Informative path planning literature (active sensing in uncertain fields)
 
 ### Phase 3 TODO
-- [ ] Decide architecture: RSSM vs transformer
-- [ ] Build latent dynamics model
-- [ ] Train on LBM time series (longer runs: 1000+ steps, transient mode)
-- [ ] Implement observation update step
-- [ ] Build adaptive drone path planner (maximize info gain)
-- [ ] Evaluate: does adaptive path beat fixed A* street path?
+- [ ] Implement simple energy + risk optimizer using Phase 2 ensemble output
+- [ ] Evaluate: does risk-aware path beat fixed A* street path?
+- [ ] Implement active sensing path: maximise uncertainty reduction per leg
+- [ ] Evaluate: does adaptive path improve forecast quality on the next leg?
+- [ ] (Optional) Learn fast latent dynamics for multi-leg rollout
 
 ---
 
@@ -144,18 +233,24 @@ Solver recommendation: OpenFOAM (free) or STAR-CCM+ / Fluent
 
 ## Open Questions / Future Decisions
 
-1. **Fixed horizon vs steady-state prediction?**
-   Current: fixed horizon (t+10 steps). If boundary conditions are stable,
-   steady-state prediction is more useful. Worth experimenting.
+1. **Latent space for Phase 2?**
+   Pixel-space at 256×256 × T_out~30 may hit memory or inference time limits.
+   If N=20 samples × 20 ODE steps cannot fit in 60s, add VAE compression before
+   the flow-matching U-Net (same approach as CoNFiLD).
 
 2. **Multi-altitude prediction?**
    Start with single 20m slice. Extension: add Z as conditioning input
-   (predict any slice given Z coordinate).
+   (predict any slice given Z coordinate). Requires multi-altitude LBM data.
 
-3. **Domain generalization?**
-   Currently city-specific (geometry baked in). Future: encode geometry
-   via graph network or implicit neural field for generalization across cities.
+3. **GNN trajectory encoder?**
+   Deferred from Phase 2. If grid splatting proves to be the accuracy bottleneck
+   (encoder missing path geometry), replace with a small GNN that processes drone
+   observations at their exact (x, y, t) positions without grid interpolation.
 
 4. **Real drone data?**
    Phase 1–3 use synthetic drone paths. Validation against real drone
    flights (when available) would strengthen the pipeline significantly.
+
+5. **Domain generalization?**
+   Currently city-specific (geometry baked in). Future: encode geometry
+   via graph network or implicit neural field for generalization across cities.
