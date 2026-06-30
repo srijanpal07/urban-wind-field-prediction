@@ -8,6 +8,9 @@ Usage:
     python train_model.py --data data/lbm_multicond.npz --model outputs/wind_fno.pth
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import glob
 import os
@@ -78,7 +81,7 @@ def main():
         print(f"  Angle range: {min(angles):.2f}° – {max(angles):.2f}°")
         print(f"  Speed range: {min(speeds):.4f} – {max(speeds):.4f}\n")
 
-        from src.train import train
+        from src.training.train_ufno import train
         model, history = train(
             condition_files=condition_files,
             obstacle_mask=obstacle_mask,
@@ -110,7 +113,7 @@ def main():
         print(f"  Angles : {angles.tolist()}")
         print(f"  Speeds : {speeds.tolist()}\n")
 
-        from src.train import train
+        from src.training.train_ufno import train
         model, history = train(
             u_all, v_all, obstacle_mask,
             save_path=args.model,

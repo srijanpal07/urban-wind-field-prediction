@@ -11,8 +11,8 @@ import os
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from .model import WindFNO, prepare_input, nll_loss
-from .drone_sampler import DroneSampler
+from src.models.ufno import WindFNO, prepare_input, nll_loss
+from src.data.drone_sampler import DroneSampler
 
 # Per-worker LRU-1 cache: avoids re-decompressing the same condition file
 # across consecutive __getitem__ calls in the same DataLoader worker process.
@@ -113,8 +113,8 @@ class WindDataset(Dataset):
         path_seed = int(rng.integers(0, 500))
         waypoints = self.sampler.make_traverse_path(seed=path_seed)
 
-        # Simulate drone trajectory: 80 samples ≈ 10 Hz × 8 s traverse
-        total_steps = 80
+        # Simulate drone trajectory: 2400 samples ≈ 10 Hz × 240 s (4-minute leg)
+        total_steps = 2400
         x_path, y_path = self.sampler.interpolate_path(waypoints, total_steps)
 
         # Add small random jitter to path for diversity

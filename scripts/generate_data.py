@@ -18,7 +18,10 @@ Usage:
 import argparse
 import hashlib
 import os
+import sys
 from itertools import product
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
@@ -169,7 +172,7 @@ def main():
     print(f"{'='*60}\n")
 
     # ── Geometry ──────────────────────────────────────────────────────────────
-    from src.geometry import stl_to_obstacle_mask, make_synthetic_city
+    from src.data.geometry import stl_to_obstacle_mask, make_synthetic_city
 
     if args.stl and os.path.exists(args.stl):
         print(f"[Geometry] Loading STL: {args.stl}")
@@ -197,7 +200,7 @@ def main():
 
     np.save('data/obstacle_mask.npy', obstacle_mask)
 
-    from src.lbm_solver import LBMSolver
+    from src.data.lbm_solver import LBMSolver
 
     # ── Training conditions ───────────────────────────────────────────────────
     train_conds = list(product(args.angles, args.speeds))

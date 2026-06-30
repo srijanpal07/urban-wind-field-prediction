@@ -31,6 +31,9 @@ Usage:
     python evaluate.py --stl data/city_model.STL --n 20
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import os
 
@@ -40,84 +43,65 @@ import torch
 REF_LBM_SPEED = 0.08   # LBM speed that maps to --ref-speed m/s (fixed scale)
 
 
-def _build_obs_grid(obs_buffer, sampler, H, sigma=4.0):
-    """Build Gaussian-splatted observation grid from rolling buffer."""
-    if not obs_buffer:
-        return (np.zeros((H, H)), np.zeros((H, H)), np.zeros((H, H)))
-    xs = np.array([o['x'] for o in obs_buffer])
-    ys = np.array([o['y'] for o in obs_buffer])
-    us = np.array([o['u'] for o in obs_buffer])
-    vs = np.array([o['v'] for o in obs_buffer])
-    obs = dict(x=xs, y=ys, u_obs=us, v_obs=vs)
-    return sampler.obs_to_grid(obs, H, sigma=sigma)
+_TOTAL_STEPS = 2400   # drone samples per prediction — 10 Hz × 240 s (4-minute leg)
+_OBS_WINDOW  = 30    # LBM snapshots spanned per observation window (matches training)
 
 
 def evaluate_condition(model, obstacle_mask, u_arr, v_arr,
-                       device, grid_size, horizon, lbm_to_ms, rng,
-                       obs_window=15, pred_every=5):
+                       device, grid_size, horizon, lbm_to_ms, rng):
     """
-    Fly a drone over one wind condition and accumulate prediction metrics.
+    Score the model on one wind condition using the same trajectory-sampling
+    method as training: 2400 drone positions spread over obs_window LBM
+    snapshots, splatted to a grid, then one prediction per time window.
+
+    Averages metrics over several non-overlapping time windows for stability.
     Returns dict with vector_rmse, speed_mae, dir_error (all in m/s / degrees).
     """
-    from src.drone_sampler import DroneSampler
-    from src.model import prepare_input
+    from src.data.drone_sampler import DroneSampler
+    from src.models.ufno import prepare_input
 
     T, H, W = u_arr.shape
     sampler  = DroneSampler(grid_size=grid_size, obstacle_mask=obstacle_mask)
-    waypoints = sampler.make_traverse_path(seed=int(rng.integers(0, 100_000)))
-    x_path, y_path = sampler.interpolate_path(waypoints, T)
 
-    obs_buffer   = []
-    vec_rmses    = []
-    speed_maes   = []
-    dir_errors   = []
-    n_obs_per_pred = 80   # match training (total_steps=80, full traverse)
-    min_obs_needed = n_obs_per_pred
+    vec_rmses, speed_maes, dir_errors = [], [], []
 
-    for t in range(T - horizon):
-        xi   = x_path[t]
-        yi   = y_path[t]
-        xi_i = int(np.clip(xi, 0, W - 1))
-        yi_i = int(np.clip(yi, 0, H - 1))
-        if not obstacle_mask[yi_i, xi_i]:
-            u_t = u_arr[t, yi_i, xi_i]
-            v_t = v_arr[t, yi_i, xi_i]
-            spd_t = float(np.sqrt(u_t**2 + v_t**2))
-            ang_t = float(np.arctan2(v_t, u_t))
-            spd_n = max(0.0, spd_t + float(rng.normal(0, sampler.noise_speed_std)))
-            ang_n = ang_t + np.deg2rad(float(rng.normal(0, sampler.noise_angle_std)))
-            obs_buffer.append({'x': xi, 'y': yi,
-                               'u': spd_n * np.cos(ang_n),
-                               'v': spd_n * np.sin(ang_n)})
+    # Non-overlapping time windows; use up to 5 for stable average
+    max_t0    = T - horizon - _OBS_WINDOW
+    n_windows = min(5, max(1, max_t0))
+    t0_step   = max(1, max_t0 // n_windows)
+    t0_list   = list(range(0, max_t0, t0_step))[:n_windows]
 
-        if len(obs_buffer) < min_obs_needed or t % pred_every != 0:
-            continue
+    for i, t0 in enumerate(t0_list):
+        waypoints = sampler.make_traverse_path(seed=int(rng.integers(0, 100_000)))
+        x_path, y_path = sampler.interpolate_path(waypoints, _TOTAL_STEPS)
 
-        recent = obs_buffer[-n_obs_per_pred:]
-        obs_u_g, obs_v_g, conf_g = _build_obs_grid(recent, sampler, H)
+        noise_scale = H * 0.02
+        x_path = np.clip(x_path + rng.normal(0, noise_scale, _TOTAL_STEPS), 0, H - 1)
+        y_path = np.clip(y_path + rng.normal(0, noise_scale, _TOTAL_STEPS), 0, H - 1)
+
+        t_indices = np.linspace(t0, t0 + _OBS_WINDOW - 1, _TOTAL_STEPS).astype(int)
+        obs = sampler.sample_field(u_arr, v_arr, x_path, y_path, t_indices)
+        obs_u_g, obs_v_g, conf_g = sampler.obs_to_grid(obs, H, sigma=3.0)
 
         x_in = prepare_input(obs_u_g, obs_v_g, conf_g, obstacle_mask, device=device)
-
         with torch.no_grad():
             u_p, v_p, _, _ = model(x_in)
 
         u_pred = u_p[0, 0].cpu().numpy()
         v_pred = v_p[0, 0].cpu().numpy()
 
-        t_target = min(t + horizon, T - 1)
+        t_target = min(t0 + _OBS_WINDOW + horizon - 1, T - 1)
         u_true   = u_arr[t_target]
         v_true   = v_arr[t_target]
 
         fluid  = ~obstacle_mask
-        u_tf   = u_true[fluid]
-        v_tf   = v_true[fluid]
-        u_pf   = u_pred[fluid]
-        v_pf   = v_pred[fluid]
+        u_tf, v_tf = u_true[fluid], v_true[fluid]
+        u_pf, v_pf = u_pred[fluid], v_pred[fluid]
 
-        vec_rmse = float(np.sqrt(np.mean((u_pf - u_tf) ** 2 +
-                                          (v_pf - v_tf) ** 2))) * lbm_to_ms
-        spd_true = np.sqrt(u_tf ** 2 + v_tf ** 2)
-        spd_pred = np.sqrt(u_pf ** 2 + v_pf ** 2)
+        vec_rmse = float(np.sqrt(np.mean((u_pf - u_tf)**2 +
+                                          (v_pf - v_tf)**2))) * lbm_to_ms
+        spd_true = np.sqrt(u_tf**2 + v_tf**2)
+        spd_pred = np.sqrt(u_pf**2 + v_pf**2)
         spd_mae  = float(np.mean(np.abs(spd_pred - spd_true))) * lbm_to_ms
 
         valid = spd_true > 0.005
@@ -245,7 +229,7 @@ def main():
         print("Train first:  python train_model.py")
         return
 
-    from src.model import WindFNO
+    from src.models.ufno import WindFNO
     ckpt      = torch.load(args.model, map_location=device)
     modes     = ckpt.get('modes', 20)
     grid_size = args.grid if args.grid is not None else ckpt.get('grid_size', 256)
@@ -256,7 +240,7 @@ def main():
     print(f"Model loaded  (modes={modes}, grid={grid_size})\n")
 
     # ── Geometry ──────────────────────────────────────────────────────────────
-    from src.geometry import stl_to_obstacle_mask, make_synthetic_city
+    from src.data.geometry import stl_to_obstacle_mask, make_synthetic_city
 
     if args.stl and os.path.exists(args.stl):
         print(f"Loading geometry from {args.stl}")
@@ -324,7 +308,7 @@ def main():
         angles = rng.uniform(0,    360,  size=args.n).tolist()
         speeds = rng.uniform(0.02, 0.10, size=args.n).tolist()
 
-        from src.lbm_solver import LBMSolver
+        from src.data.lbm_solver import LBMSolver
 
         print(COL)
         print(SEP)

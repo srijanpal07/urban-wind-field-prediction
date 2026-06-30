@@ -19,6 +19,9 @@ Usage:
   python run_pipeline.py --stl city.stl --save output.gif
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import hashlib
 import os
@@ -61,7 +64,7 @@ def main():
     print(f"{'='*60}\n")
 
     # ── Step 1: Geometry ──────────────────────────────────────────────────
-    from src.geometry import stl_to_obstacle_mask, make_synthetic_city
+    from src.data.geometry import stl_to_obstacle_mask, make_synthetic_city
 
     domain_m = None
     if args.stl and os.path.exists(args.stl):
@@ -113,7 +116,7 @@ def main():
         print(f"      Grid: {args.grid}×{args.grid}  |  "
               f"Warmup: {args.warmup}  |  Collect: {args.steps}  |  "
               f"Speed: {args.speed}  |  Angle: {args.angle}°")
-        from src.lbm_solver import LBMSolver
+        from src.data.lbm_solver import LBMSolver
         solver = LBMSolver(obstacle_mask, inlet_speed=args.speed,
                            inlet_angle=args.angle, tau=0.7)
         u_arr, v_arr = solver.run(n_warmup=args.warmup,
@@ -132,7 +135,7 @@ def main():
         print(f"\n[3/4] Training U-FNO model...")
         print(f"      Epochs: {args.epochs}  |  Batch: {args.batch}  |  "
               f"LR: {args.lr}  |  Horizon: {args.horizon}")
-        from src.train import train
+        from src.training.train_ufno import train
         # Wrap single condition as [1, T, H, W] for the multi-condition API
         model, history = train(
             u_arr[np.newaxis], v_arr[np.newaxis], obstacle_mask,
@@ -174,7 +177,7 @@ def main():
 
     # Load best saved model
     if os.path.exists(args.model):
-        from src.model import WindFNO
+        from src.models.ufno import WindFNO
         ckpt = torch.load(args.model, map_location=device)
         modes = ckpt.get('modes', 20)
         model = WindFNO(in_channels=6, out_channels=4,
@@ -193,7 +196,7 @@ def main():
         args.save = 'outputs/wind_dashboard.gif'
         print(f"      Full pipeline: saving dashboard to {args.save}")
 
-    from src.visualize import Dashboard
+    from src.viz.visualize import Dashboard
     lbm_to_ms = args.ref_speed / abs(args.speed)
     dash = Dashboard(u_arr, v_arr, obstacle_mask, model=model, device=device,
                      lbm_to_ms=lbm_to_ms, domain_m=domain_m)

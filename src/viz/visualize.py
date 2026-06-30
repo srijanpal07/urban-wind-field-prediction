@@ -25,10 +25,10 @@ import argparse
 import os
 import torch
 
-from .geometry import stl_to_obstacle_mask, make_synthetic_city
-from .lbm_solver import LBMSolver
-from .drone_sampler import DroneSampler
-from .model import WindFNO, prepare_input
+from src.data.geometry import stl_to_obstacle_mask, make_synthetic_city
+from src.data.lbm_solver import LBMSolver
+from src.data.drone_sampler import DroneSampler
+from src.models.ufno import WindFNO, prepare_input
 
 
 # ─── Colour palette ────────────────────────────────────────────────────────────

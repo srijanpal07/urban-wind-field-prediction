@@ -26,7 +26,7 @@ Status:
 
 ---
 
-## Phase 2: Spatiotemporal Flow-Matching Forecast Model 🔜 NEXT
+## Phase 2: Spatiotemporal Flow-Matching Forecast Model 🔄 IN PROGRESS
 
 Goal: Replace U-FNO with a flow-matching generative model that forecasts the
       full 5-minute future wind field evolution from the past 5 minutes of
@@ -120,10 +120,13 @@ Online inference at each waypoint (target: <60s for N=20 on RTX 5000 Ada):
 
 ### Training data requirements
 
-Current LBM cache has 150 snapshots per condition (~2–3 min simulated time).
-Need extension to extract enough non-overlapping 10-min (obs+forecast) pairs:
-- Target: 500+ snapshots per condition (~10–15 min simulated time per run)
-- Re-run generate_data.py with `--steps 500` (and `--warmup 2000` to keep it)
+LBM cache regenerated at 500 snapshots/condition, 512×512 (`--steps 500 --warmup
+2000`), 128 train + 16 test conditions — completed June 2026. Note: 500 LBM
+snapshots is ~6.7s of simulated LBM time (see `dt_snapshot` derivation in
+CLAUDE.md), not 10–15 minutes — the "5-minute forecast" refers to real drone
+flight time under the 15-minute atmospheric stability assumption, not LBM
+simulated time. The snapshot count was raised for more training *windows* per
+condition, not temporal coverage.
 
 ### Key references
 
@@ -137,17 +140,81 @@ Need extension to extract enough non-overlapping 10-min (obs+forecast) pairs:
 
 ### Phase 2 TODO
 
-- [ ] Extend LBM runs: `--steps 500` per condition; rebuild data cache
-- [ ] Build spatiotemporal U-Net backbone (3D conv + 2D spatial + 1D temporal attention)
-- [ ] Implement flow-matching training loop (straight-line x_t, velocity loss)
-- [ ] Wire geometry conditioning: CNN encoder + channel concat at every U-Net scale
-- [ ] Implement DPS guidance at inference (autodiff through H operator)
-- [ ] Implement Leray projection post-processing (2D FFT)
-- [ ] Implement obstacle mask hard constraint post-processing
-- [ ] Batch N=20 ensemble samples on GPU; benchmark inference time vs 60s target
+- [x] Extend LBM runs: `--steps 500` per condition; rebuild data cache (running, 512×512)
+- [x] Build spatiotemporal U-Net backbone (3D conv + 2D spatial + 1D temporal attention)
+- [x] Implement flow-matching training loop (straight-line x_t, velocity loss)
+- [x] Wire geometry conditioning: CNN encoder + channel concat at every U-Net scale
+- [x] Implement DPS guidance at inference (autodiff through H operator)
+- [x] Implement Leray projection post-processing (2D FFT)
+- [x] Implement obstacle mask hard constraint post-processing
+- [x] Batch N=20 ensemble samples on GPU; benchmark inference time vs 60s target
+- [x] SDF geometry channel (binary mask + signed distance field conditioning)
+- [x] Physics-informed flow-matching prior (divergence-free ambient field, not pure noise)
+- [x] Ensemble calibration utility (spread-skill correlation, interval coverage)
+- [x] Fix DPS guidance channel-slicing bug (was reading [mask,obs_v] instead of [obs_u,obs_v])
+- [ ] Full 200-epoch training run on 128 conditions × 500 snapshots (launching)
+- [ ] Evaluate: compare U-FNO (deterministic snapshot) vs flow-matching (ensemble forecast)
+- [ ] Run calibration check on a trained model (spread-error correlation, 90% coverage)
 - [ ] Implement path-conditioned exceedance probability risk metric
 - [ ] Update visualization: ensemble spread, mean field, risk overlay on candidate paths
-- [ ] Evaluate: compare U-FNO (deterministic snapshot) vs flow-matching (ensemble forecast)
+
+### Implementation Notes (June 2026)
+
+- **Attention memory constraint**: SpatialAttnBlock is O(H²W²). At 512×512, attention
+  is only applied at ≤64×64 feature maps (`attn_start = ceil(log2(grid_size/64))`).
+  Applying attention at 128×128 requires 1.1 GB/head and causes OOM.
+- **Training memory**: AMP (float16) + gradient checkpointing required at 512×512.
+  Recommended: `--hidden 32 --batch 4` (23.7 GB peak VRAM on RTX 5000 Ada).
+- **T_out vs physical time**: T_out=10 frames at collect_every=3 ≈ 0.4s of LBM
+  simulated time. The "5-minute forecast" refers to real flight time under the
+  15-minute atmospheric stability assumption, not 5 min of LBM dynamics.
+- **Smoke test (3 epochs, 19 conditions)**: Train 0.106→0.022, Val 0.056→0.019.
+  Clean convergence confirmed. Pipeline end-to-end verified.
+- **Smoke test #2, post architecture changes (1 epoch, 2 conditions, 512×512,
+  hidden=32, AMP+checkpoint, physics prior on)**: Train 0.032, Val 0.013. Confirms
+  SDF channels + physics-informed prior + DPS bug fix work end-to-end on real
+  data before committing to the full 200-epoch run.
+
+### Recommendations Triage (June 2026)
+
+An external 8-point architectural review was assessed against the actual state
+of the codebase before the full training run. Disposition:
+
+**Implemented now** (cheap, additive, didn't require restarting training since
+no full run had started yet):
+- SDF geometry channel (`src/data/geometry.mask_to_sdf`) — smoother gradients
+  near building walls than the binary mask alone.
+- Physics-informed flow-matching prior (`FlowMatchingModel.physics_prior`) —
+  source distribution is now a confidence-weighted ambient field, zeroed inside
+  obstacles and Leray-projected to divergence-free, instead of pure Gaussian
+  noise. The network now only has to learn the obstacle-wake correction, not
+  the whole field from scratch.
+- Ensemble calibration utility (`src/evaluation/calibration.py`) — spread-skill
+  correlation + interval coverage, wired into `infer_fm.py` output.
+- **Bug found and fixed during this work**: `FlowMatchingModel.sample()`'s DPS
+  guidance term sliced `obs[:, :2]` / `obs[:, 2:3]` as if channel 0 were obs_u —
+  it's actually the geometry mask. DPS was guiding against `[mask, obs_v]`
+  instead of `[obs_u, obs_v]` weighted by confidence. Fixed to `obs[:, 1:3]` /
+  `obs[:, 3:4]`. This was silently degrading every prior ensemble inference run.
+
+**Already on the roadmap, not pulled forward**: state-update/data-assimilation
+formulation and "flow state evolves with each observation" (recursive latent
+dynamics) are Phase 3's RSSM/world-model concept (see Phase 3 below), not a
+Phase 2 change. Pulling them into Phase 2 now would mean replacing an
+unevaluated model with an unbuilt one. Decision: finish the Phase 2 ensemble
+run, evaluate it, and only escalate to a stateful formulation if evaluation
+shows partial-observability failures the ensemble can't address.
+
+**Already deferred for a documented reason, no new information changes that**:
+richer observation encoding (GNN over grid-splatting) — see Open Question 3
+below. Still deferred until ablation shows splatting is the bottleneck.
+
+**Not pursued**: physics-prior-as-residual-target (predicting a correction to
+a full potential-flow/Stokes solve rather than using the prior as the
+flow-matching source distribution) — the source-distribution version
+implemented above captures most of the benefit (network starts closer to the
+answer) at a fraction of the engineering cost (no PDE solve per sample, reuses
+the existing Leray projection).
 
 ---
 

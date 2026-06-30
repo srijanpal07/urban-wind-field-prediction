@@ -189,6 +189,28 @@ def stl_to_obstacle_mask(stl_path: str, grid_size: int = 128,
     return mask, bounds
 
 
+def mask_to_sdf(mask: np.ndarray) -> np.ndarray:
+    """
+    Signed distance field from a binary obstacle mask (True = solid).
+    Positive outside obstacles (distance to nearest wall), negative inside
+    (distance to nearest exterior), normalized by grid_size so the range is
+    comparable across resolutions. Smoother than the binary mask near walls,
+    which helps the network learn boundary-layer behavior.
+    """
+    from scipy.ndimage import distance_transform_edt
+    grid_size = mask.shape[0]
+    dist_out = distance_transform_edt(~mask)
+    dist_in = distance_transform_edt(mask)
+    sdf = dist_out - dist_in
+    return (sdf / grid_size).astype(np.float32)
+
+
+def build_geo_channels(obstacle_mask: np.ndarray) -> np.ndarray:
+    """[H,W] bool -> [2,H,W] float32: binary mask + normalized SDF."""
+    sdf = mask_to_sdf(obstacle_mask)
+    return np.stack([obstacle_mask.astype(np.float32), sdf], axis=0)
+
+
 def make_synthetic_city(grid_size: int = 128, seed: int = 42):
     """
     Generate a synthetic city obstacle mask when no STL is available.

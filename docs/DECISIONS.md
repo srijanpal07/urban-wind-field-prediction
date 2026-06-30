@@ -186,6 +186,35 @@ does not need negation — `origin='lower'` is handled correctly by quiver.
 
 ---
 
+## Drone Sampling: 80 → 2400 Samples (June 2026)
+
+The original training used `total_steps=80` drone samples per training example
+(~8 seconds at 10 Hz). This was unrealistic — a real 4-minute survey leg at 10 Hz
+yields 2400 samples. The fix was straightforward:
+
+1. Changed `total_steps = 2400` in both `train_ufno.py` and `train_fm.py`
+2. Vectorized `obs_to_grid()` — the old per-observation Python loop was O(N×patch²)
+   and would take ~50ms at 2400 samples. Replaced with bilinear scatter
+   (`np.add.at`) + `scipy.ndimage.gaussian_filter`, reducing to ~1ms.
+3. Updated `evaluate_ufno.py` to match the new sampling protocol (old rolling-buffer
+   approach couldn't reach 2400 obs within T=150 LBM snapshots).
+
+---
+
+## Repo Reorganization (June 2026)
+
+Root-level scripts were moved to `scripts/` and `src/` was split into subpackages
+(`data/`, `models/`, `training/`, `viz/`) to match a professional ML project layout.
+Each `scripts/*.py` file adds `sys.path.insert(0, project_root)` to find `src`.
+
+Phase 1 outputs were archived to `outputs/ufno/` to preserve the U-FNO baseline
+while making `outputs/flow_matching/` the active output directory for Phase 2.
+
+A `.gitignore` bug was also fixed: unanchored `data/` and `outputs/` patterns were
+silently ignoring `src/data/` Python files. Fixed to `/data/` and `/outputs/` (root-only).
+
+---
+
 ## Phase 2 Design Decisions (June 2026)
 
 ### Why flow matching instead of DDPM for Phase 2?
@@ -261,6 +290,31 @@ a second model to train and validate.
 Pixel space is simpler and avoids the two-stage training complexity. Latent
 space is added only if memory or inference benchmarking shows it is needed.
 
+### Why resolution-aware attention gating?
+
+`SpatialAttnBlock` has O(H²W²) memory cost for the attention matrix. At 512×512:
+- Level 2 feature map (128×128): 16,384 tokens → 1.1 GB/head → OOM during backward
+- Level 3 (64×64): 4,096 tokens → 67 MB/head → feasible
+
+Fix: `attn_start = max(0, ceil(log2(grid_size / 64)))` so attention is only
+instantiated at levels where the feature map is ≤64×64. For grid=512: attn_start=3
+means only the deepest encoder level (64×64) and bottleneck (32×32) have attention.
+This is resolution-adaptive — smaller grids automatically get more attention levels.
+
+### Why AMP + gradient checkpointing for Phase 2 training?
+
+At 512×512 with T_out=10, the backward pass stores activations for all layers.
+Level 0 features alone: [B*T, hidden, 512, 512] = [4*10, 32, 512, 512] → ~2.7 GB.
+Summing over all levels: ~8–10 GB, plus gradients doubling this.
+
+- **AMP (float16)**: halves activation memory; negligible effect on loss convergence
+  for this regression task. Enabled by default via `torch.amp.autocast`.
+- **Gradient checkpointing**: recomputes activations during backward instead of
+  storing them; ~4× activation memory saving at the cost of ~30% more compute.
+  Applied per encoder/decoder level via `torch.utils.checkpoint.checkpoint`.
+
+Result: hidden=32, batch=4, T_out=10 → 23.7 GB peak (fits in 32 GB with headroom).
+
 ### Why GNN trajectory encoder is deferred?
 
 The current grid-splatting approach (obs_u, obs_v, confidence channels) places
@@ -268,6 +322,55 @@ drone observations at their grid cell locations and is already working in Phase 
 A GNN encoder handles irregular path geometry more naturally but adds a new model
 component and training dependency. The added complexity is only justified if
 ablation studies show the grid splatting is the accuracy bottleneck.
+
+### Why SDF geometry channel in addition to the binary mask?
+
+The binary obstacle mask is a step function — zero gradient everywhere except
+a one-pixel discontinuity at building walls. A signed distance field (positive
+outside, negative inside, computed via `scipy.ndimage.distance_transform_edt`)
+gives the network a smooth proximity-to-wall signal everywhere, which is
+exactly the quantity that matters for near-wall flow behavior (boundary layers,
+wake formation). Cost is negligible — one EDT call per geometry, cached once
+in `WindSequenceDataset.__init__` since the city geometry is fixed across the
+whole dataset. `GeometryEncoder` input channels: 1 → 2 (mask + SDF); its output
+(8 channels into the U-Net) is unchanged, so this is a fully localized change.
+
+### Why a physics-informed prior instead of pure Gaussian noise for flow matching?
+
+Flow matching only requires that you can sample from the source distribution
+and compute `x_target − x_noise`; the source doesn't have to be Gaussian. Pure
+noise means the network has to learn the entire field — geometry-driven mean
+flow and obstacle wakes — from scratch at every ODE step. Instead,
+`FlowMatchingModel.physics_prior()` builds a confidence-weighted ambient (u, v)
+estimate from the sparse drone observations, broadcasts it to a uniform field,
+zeroes it inside obstacles, and Leray-projects it to divergence-free (reusing
+the existing projection function, not a new mechanism). Gaussian noise is
+still added on top so the prior remains a proper distribution — ensemble
+diversity at inference still comes from sampling, not a deterministic prior.
+
+This is strictly additive: `use_physics_prior` defaults to `True` but can be
+disabled (`--no-physics-prior`) for ablation, and inference reads the flag
+from the training checkpoint so train/sample distributions always match (flow
+matching requires the same source distribution at training and sampling time).
+
+### Why an ensemble calibration utility (`src/evaluation/calibration.py`)?
+
+DPS-guided ensembles only support risk-aware path planning if the ensemble
+spread is trustworthy — i.e. it's larger exactly where the prediction is more
+wrong. This wasn't being measured anywhere. `spread_skill()` (spread-error
+correlation) and `coverage()` (does the empirical N% interval actually contain
+truth N% of the time) are cheap numpy functions, wired into `infer_fm.py`'s
+output. No architecture change, just an evaluation gap that's now closed.
+
+### Bug fix: DPS guidance was reading the wrong observation channels
+
+`obs` channels are `[mask, obs_u, obs_v, confidence, x, y]` (channel 0 is
+geometry, not data). `FlowMatchingModel.sample()`'s DPS guidance term read
+`obs_uv = obs[:, :2]` and `conf = obs[:, 2:3]` — i.e. `[mask, obs_v]` as the
+"measured u,v" and `obs_v` as "confidence". Every ensemble inference run prior
+to this fix was guiding generation toward the wrong target. Fixed to
+`obs[:, 1:3]` / `obs[:, 3:4]`. Caught while implementing the physics prior,
+which required correctly identifying the same channel layout.
 
 ### Why 15-minute wind stability matters for training design?
 

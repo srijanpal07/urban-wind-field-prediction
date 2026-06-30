@@ -21,6 +21,9 @@ Usage:
     python infer.py --stl data/city_model.STL --seed 7
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import os
 
@@ -72,7 +75,7 @@ def main():
     model     = None
     grid_size = args.grid  # fallback if no checkpoint
     if os.path.exists(args.model):
-        from src.model import WindFNO
+        from src.models.ufno import WindFNO
         ckpt      = torch.load(args.model, map_location=device)
         modes     = ckpt.get('modes', 20)
         grid_size = args.grid if args.grid is not None else ckpt.get('grid_size', 256)
@@ -86,7 +89,7 @@ def main():
         print(f"      Not found — showing persistence baseline")
 
     # ── Geometry ──────────────────────────────────────────────────────────────
-    from src.geometry import stl_to_obstacle_mask, make_synthetic_city
+    from src.data.geometry import stl_to_obstacle_mask, make_synthetic_city
 
     domain_m = None
     if args.stl and os.path.exists(args.stl):
@@ -100,7 +103,7 @@ def main():
 
     # ── LBM simulation ────────────────────────────────────────────────────────
     print(f"[3/3] Running LBM  (warmup={args.warmup}, collect={args.steps}, grid={grid_size})...")
-    from src.lbm_solver import LBMSolver
+    from src.data.lbm_solver import LBMSolver
 
     solver = LBMSolver(obstacle_mask, inlet_speed=speed,
                        inlet_angle=angle, tau=0.7)
@@ -109,7 +112,7 @@ def main():
     print(f"      Wind field: {u_arr.shape}")
 
     # ── Visualize ─────────────────────────────────────────────────────────────
-    from src.visualize import Dashboard
+    from src.viz.visualize import Dashboard
 
     print(f"\nLaunching dashboard  [angle={angle:.0f}°  speed={physical_inlet:.2f} m/s]")
     dash = Dashboard(u_arr, v_arr, obstacle_mask,

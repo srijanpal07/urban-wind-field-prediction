@@ -8,6 +8,7 @@ Returns sparse (x, y, u_noisy, v_noisy, t) observations.
 """
 
 import numpy as np
+import scipy.ndimage
 
 
 class DroneSampler:
@@ -266,48 +267,61 @@ class DroneSampler:
     def obs_to_grid(self, obs: dict, grid_size: int, sigma: float = 3.0):
         """
         Scatter sparse observations onto a grid using Gaussian splatting.
+
+        Uses bilinear scatter + scipy separable Gaussian filter — O(N + H×W)
+        instead of O(N × patch²) with a Python loop, so it stays fast even
+        at 2400 samples per training example.
+
         Returns:
           obs_u_grid   : [H, W] interpolated u observations
           obs_v_grid   : [H, W] interpolated v observations
           obs_mask     : [H, W] float, confidence weight per cell
         """
         H = W = grid_size
-        xs = np.asarray(obs['x'],     dtype=np.float32)
-        ys = np.asarray(obs['y'],     dtype=np.float32)
-        us = np.asarray(obs['u_obs'], dtype=np.float32)
-        vs = np.asarray(obs['v_obs'], dtype=np.float32)
+        xs = np.asarray(obs['x'],     dtype=np.float64)
+        ys = np.asarray(obs['y'],     dtype=np.float64)
+        us = np.asarray(obs['u_obs'], dtype=np.float64)
+        vs = np.asarray(obs['v_obs'], dtype=np.float64)
 
         valid = ~(np.isnan(us) | np.isnan(vs))
         if not valid.any():
             return np.zeros((H, W)), np.zeros((H, W)), np.zeros((H, W))
         xs, ys, us, vs = xs[valid], ys[valid], us[valid], vs[valid]
 
+        u_acc = np.zeros((H, W), dtype=np.float64)
+        v_acc = np.zeros((H, W), dtype=np.float64)
+        w_acc = np.zeros((H, W), dtype=np.float64)
+
+        # Bilinear scatter: each observation contributes to its 4 grid neighbours
+        # weighted by bilinear coefficients, then a separable Gaussian filter
+        # spreads each point mass by sigma cells (equivalent to per-point Gaussian
+        # splatting but computed via fast convolution in O(H×W) instead of O(N×patch²)).
+        xi = np.clip(xs, 0, W - 1)
+        yi = np.clip(ys, 0, H - 1)
+        x0 = np.floor(xi).astype(int).clip(0, W - 2)
+        y0 = np.floor(yi).astype(int).clip(0, H - 2)
+        dx = xi - x0
+        dy = yi - y0
+
+        for (cy, cx, bw) in [
+            (y0,     x0,     (1 - dy) * (1 - dx)),
+            (y0,     x0 + 1, (1 - dy) * dx),
+            (y0 + 1, x0,     dy       * (1 - dx)),
+            (y0 + 1, x0 + 1, dy       * dx),
+        ]:
+            np.add.at(u_acc, (cy, cx), bw * us)
+            np.add.at(v_acc, (cy, cx), bw * vs)
+            np.add.at(w_acc, (cy, cx), bw)
+
+        u_blur = scipy.ndimage.gaussian_filter(u_acc, sigma=sigma)
+        v_blur = scipy.ndimage.gaussian_filter(v_acc, sigma=sigma)
+        w_blur = scipy.ndimage.gaussian_filter(w_acc, sigma=sigma)
+
+        nz = w_blur > 1e-6
         u_grid = np.zeros((H, W), dtype=np.float32)
         v_grid = np.zeros((H, W), dtype=np.float32)
-        w_grid = np.zeros((H, W), dtype=np.float32)
-
-        r       = int(np.ceil(3.0 * sigma))
-        inv_2s2 = np.float32(0.5 / sigma**2)
-        gx_all  = np.arange(W, dtype=np.float32)
-        gy_all  = np.arange(H, dtype=np.float32)
-
-        for i in range(len(xs)):
-            x0 = max(0, int(xs[i]) - r);  x1 = min(W, int(xs[i]) + r + 1)
-            y0 = max(0, int(ys[i]) - r);  y1 = min(H, int(ys[i]) + r + 1)
-
-            px = gx_all[x0:x1]   # [w_patch]
-            py = gy_all[y0:y1]   # [h_patch]
-            # Vectorized 2-D Gaussian over the patch — no inner Python loops
-            d2 = (px[None, :] - xs[i])**2 + (py[:, None] - ys[i])**2  # [h, w]
-            w  = np.exp(-d2 * inv_2s2)
-
-            u_grid[y0:y1, x0:x1] += w * us[i]
-            v_grid[y0:y1, x0:x1] += w * vs[i]
-            w_grid[y0:y1, x0:x1] += w
-
-        nz = w_grid > 1e-6
-        u_grid[nz] /= w_grid[nz]
-        v_grid[nz] /= w_grid[nz]
-        w_norm = np.clip(w_grid / (w_grid.max() + 1e-10), 0.0, 1.0)
+        u_grid[nz] = (u_blur[nz] / w_blur[nz]).astype(np.float32)
+        v_grid[nz] = (v_blur[nz] / w_blur[nz]).astype(np.float32)
+        w_norm = np.clip(w_blur / (w_blur.max() + 1e-10), 0.0, 1.0).astype(np.float32)
 
         return u_grid, v_grid, w_norm
