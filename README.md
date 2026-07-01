@@ -13,7 +13,26 @@ forecasting, conditioned on known urban geometry.
 | Phase 3 — Trajectory Optimization | Risk-aware drone path planning from ensemble | ⏳ Planned |
 | Phase 4 — Real CFD | Replace LBM solver with OpenFOAM | ⏳ Planned |
 
-## Current Results (Phase 1 — U-FNO)
+## Current Results (Phase 2 — Flow Matching, epoch 10)
+
+![Flow-matching ensemble: drone traverses A→W1→W2→B, prediction updates at each waypoint showing spread narrowing as observations accumulate](docs/assets/fm_dashboard.gif)
+
+Three-stage data assimilation: the drone flies A → W1 → W2 → B and the model
+generates a fresh ensemble at each waypoint using all observations collected
+so far. The spread (σ) panel shows uncertainty concentrating in unobserved
+regions and narrowing along the drone path. Results at epoch 10 of run #3
+(45°, 5.0 m/s, 512×512):
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Ensemble-mean RMSE | 3.14 m/s | vs 1.92 m/s at run #2 epoch 10 (no obs penalty) |
+| Spread-error correlation | +0.352 | was −0.012 in run #2 — ensemble now informative |
+| 90% interval coverage | 0.283 | improves with more training |
+| Near-obstacle \|div u\| | 0.0026 | physics penalties working |
+
+Training ongoing (run #3, epoch ~15/200 at time of writing).
+
+## Phase 1 Results (U-FNO, Archived)
 
 ![U-FNO live dashboard: ground truth, prediction, uncertainty, error, drone trajectory, and RMSE/MAE over time](docs/assets/ufno_dashboard.gif)
 
@@ -22,10 +41,6 @@ Held-out test set (16 unseen conditions, 512×512 grid, 128 training conditions)
 | Vec RMSE | Speed MAE | Direction Error |
 |----------|-----------|------------------|
 | 2.75 m/s | 1.87 m/s  | 43.4°            |
-
-Phase 2 (flow matching) is currently training; once complete, this section
-will be updated with the ensemble forecast results and calibration metrics
-(spread-error correlation, 90% interval coverage).
 
 ## Setup
 

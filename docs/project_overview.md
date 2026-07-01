@@ -73,12 +73,23 @@ Bottleneck: only 80 drone samples per training example (~8s traverse). Fixed to
 - **Physics-informed prior**: flow-matching source distribution is a
   confidence-weighted, Leray-projected ambient field (not pure Gaussian) —
   `use_physics_prior=True` by default, must match between train and sample
-- **Training**: straight-line flow matching loss; AMP + grad checkpointing for 512²
-- **Inference**: DPS-guided ODE (20 steps), Leray projection, obstacle mask zeroing,
-  calibration metrics (spread-error correlation, 90% coverage) printed every run
+- **Training**: straight-line flow matching loss + three soft physics penalties
+  on `x_hat1 = x_t + (1-s)*v_pred`: `lambda_div=0.1` (divergence in fluid
+  cells), `lambda_solid=0.1` (no-penetration at solid cells), `lambda_obs=1.0`
+  (observation-consistency — forces x_hat1 to match drone measurements at
+  observed locations, normalized by sum(obs_conf) not .mean()). AMP + grad
+  checkpointing. `flow_match_loss()` returns dict with all components.
+- **Inference**: DPS-guided ODE (20 steps, rho=0.5), AMP in sample() (~94s for
+  N=20, chunk_size=1 to avoid OOM), Leray projection, obstacle mask zeroing,
+  full calibration suite (spread-error corr, 90% coverage, divergence residual
+  global + near-obstacle)
+- **Visualization**: `scripts/viz_fm.py` — multi-segment A→W1→W2→B animation
+  with three DPS inference updates showing prediction sharpening as observations
+  accumulate. No path noise jitter in viz (training-only augmentation).
 - **Config**: hidden=32, batch=4, T_out=10, n_levels=4 → 23.7 GB peak VRAM
-- **Smoke tests**: (3 epochs, 19 conditions) train 0.106→0.022, val 0.056→0.019;
-  (1 epoch, 2 real conditions, post SDF/physics-prior changes) train 0.032, val 0.013 ✓
+- **Training history**: Run #1 (ep30, no obs penalty, archived as
+  fm_model_pre_physics_loss.pth) → Run #2 (ep42, +div/solid, val=0.000325) →
+  **Run #3** (active, +lambda_obs=1.0, ep10 eval: RMSE=3.14 m/s, corr=+0.352)
 
 ## Key Implementation Notes
 
@@ -91,3 +102,10 @@ Bottleneck: only 80 drone samples per training example (~8s traverse). Fixed to
   bug that read the wrong two channels (`[mask,obs_v]` instead of `[obs_u,obs_v]`)
   was found and fixed while implementing the physics prior; affected every prior
   ensemble inference run's conditioning quality
+- **Leray projection is not exact near obstacles**: it's a periodic-domain FFT
+  projection; masking solid cells *after* projecting can reintroduce divergence
+  right at building edges. Confirmed via a synthetic test (near-obstacle
+  residual ~47x interior residual) — see `divergence_residual()` in
+  `src/evaluation/calibration.py`. Training now includes soft `lambda_div`/
+  `lambda_solid` penalties to shrink this residual rather than relying solely
+  on the post-hoc projection

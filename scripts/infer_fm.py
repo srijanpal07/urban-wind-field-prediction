@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import os
+import time
 
 import numpy as np
 import torch
@@ -120,6 +121,13 @@ def main():
                                collect_every=3, transient=True)
     T, H, W = u_arr.shape
     print(f"      Wind field: {u_arr.shape}")
+    # Free LBM solver GPU tensors — they are no longer needed after data
+    # collection (u_arr/v_arr are already numpy on CPU). Without this, the
+    # LBM lattice stays resident and leaves no VRAM headroom for the DPS
+    # forward+backward during model.sample().
+    del solver
+    if device == 'cuda':
+        torch.cuda.empty_cache()
 
     t0 = max(0, T - _OBS_WINDOW - T_out)
     t_seq_start = t0 + _OBS_WINDOW
@@ -172,9 +180,18 @@ def main():
     # ── Ensemble sampling ──────────────────────────────────────────────────────
     print(f"\nSampling {args.n_samples} ensemble members "
           f"({args.n_steps} ODE steps, rho={args.rho})...")
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    _t_sample_start = time.perf_counter()
     samples = model.sample(obs_t, mask_t, n_samples=args.n_samples,
                             n_steps=args.n_steps, rho=args.rho, device=device,
                             solid_mask=solid_mask_t, use_physics_prior=use_physics_prior)
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    sample_time_s = time.perf_counter() - _t_sample_start
+    print(f"      Ensemble sampling took {sample_time_s:.2f}s "
+          f"({sample_time_s / args.n_steps:.3f}s/ODE-step, "
+          f"{sample_time_s / args.n_samples:.3f}s/sample-equivalent)")
     # samples: [n_samples, 2, T_out, H, W]
 
     u_samp = samples[:, 0]  # [n_samples, T_out, H, W]
@@ -206,12 +223,20 @@ def main():
     mean_rmse = np.sqrt(mean_diff[:, fluid_mask_np].mean()) * lbm_to_ms
     mean_spread = spread[:, fluid_mask_np].mean() * lbm_to_ms
 
-    from src.evaluation.calibration import spread_skill, coverage
+    from src.evaluation.calibration import spread_skill, coverage, divergence_residual
 
     ensemble_uv = np.stack([u_proj_np, v_proj_np], axis=1)       # [N, 2, T, H, W]
     truth_uv = np.stack([u_seq_true, v_seq_true], axis=0)        # [2, T, H, W]
     calib = spread_skill(ensemble_uv, truth_uv, fluid_mask_np)
     cov90 = coverage(ensemble_uv, truth_uv, fluid_mask_np, interval=0.9)
+
+    # Divergence-free check on the ensemble-mean field (post Leray-projection
+    # + obstacle masking — i.e. the field actually used downstream). The
+    # projection assumes a periodic domain with no internal obstacles, so
+    # masking solid cells afterward can reintroduce divergence right at
+    # building edges even when the open interior is clean.
+    div_stats = divergence_residual(u_mean, v_mean, fluid_mask_np,
+                                     obstacle_mask=obstacle_mask, boundary_width=2)
 
     print(f"\n{'='*55}")
     print(f" Ensemble Statistics  (lbm_to_ms = {lbm_to_ms:.1f})")
@@ -223,6 +248,13 @@ def main():
           f"(want > 0 — spread should track where the model is wrong)")
     print(f" 90% interval coverage              : {cov90:.3f}  "
           f"(want ~0.90 — <<0.90 overconfident, >>0.90 underconfident)")
+    print(f" Mean |div u| (all fluid cells)     : {div_stats['mean_abs_div']:.4f}")
+    if 'mean_abs_div_near_obstacle' in div_stats:
+        print(f"   - near obstacles (<=2 cells)      : {div_stats['mean_abs_div_near_obstacle']:.4f}")
+        print(f"   - open interior                   : {div_stats['mean_abs_div_interior']:.4f}")
+    fits_budget = "within" if sample_time_s < 60 else "EXCEEDS"
+    print(f" Ensemble sampling time              : {sample_time_s:.2f}s  "
+          f"({fits_budget} the ~60s real-time inference budget from the timing contract)")
     print(f"{'='*55}\n")
 
     # ── Visualization ──────────────────────────────────────────────────────────

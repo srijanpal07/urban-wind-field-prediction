@@ -346,16 +346,63 @@ class FlowMatchingModel(nn.Module):
         field = field + noise_std * torch.randn_like(field)
         return field
 
+    @staticmethod
+    def _log_spectral_loss(u_hat: torch.Tensor, v_hat: torch.Tensor,
+                            u_gt: torch.Tensor, v_gt: torch.Tensor) -> torch.Tensor:
+        """
+        Log-spectral L2 distance between predicted and ground-truth 2D energy
+        spectra (full FFT grid, not radially binned — our flow has a dominant
+        wind direction, so isotropic radial averaging would wash out real
+        anisotropic structure). u_hat, v_hat, u_gt, v_gt: [B, T, H, W].
+
+        MSE-style losses are known to bias predictions toward over-smoothed,
+        low-frequency output (safe averaging reduces pointwise error without
+        reproducing high-frequency turbulent detail). This penalizes energy
+        mismatch directly so under-texturing shows up as loss, not just as a
+        qualitative "looks blurry" impression at inference time. log1p keeps
+        the loss from being dominated by the largest scales, since energy
+        density spans orders of magnitude across wavenumbers.
+
+        Note: solid cells are zeroed in both signals (dataset + lambda_solid
+        penalty), so the building-edge spectral artifact this creates is
+        common to both sides and the network should learn it quickly from the
+        (fixed, single) geometry — the residual loss signal beyond that is
+        genuine flow-physics spectral mismatch.
+        """
+        U, V = torch.fft.rfft2(u_hat), torch.fft.rfft2(v_hat)
+        Ug, Vg = torch.fft.rfft2(u_gt), torch.fft.rfft2(v_gt)
+        E = U.abs() ** 2 + V.abs() ** 2
+        Eg = Ug.abs() ** 2 + Vg.abs() ** 2
+        return (torch.log1p(E) - torch.log1p(Eg)).pow(2).mean()
+
     def flow_match_loss(self, x_target: torch.Tensor, obs: torch.Tensor,
                          mask: torch.Tensor, solid_mask: torch.Tensor = None,
                          use_checkpoint: bool = False,
-                         use_physics_prior: bool = True) -> torch.Tensor:
+                         use_physics_prior: bool = True,
+                         lambda_div: float = 0.1, lambda_solid: float = 0.1,
+                         lambda_spectral: float = 0.0,
+                         lambda_obs: float = 1.0) -> dict:
         """
         x_target: [B, 2, T_out, H, W] ground truth future sequence
-        obs:      [B, obs_channels, H, W]
+        obs:      [B, obs_channels, H, W]  channels: 0=mask, 1=obs_u, 2=obs_v,
+                  3=confidence, 4=x, 5=y
         mask:     [B, geo_in_channels, H, W]
-        solid_mask: optional [H, W] bool, True = solid (excluded from loss,
-                    also used to build the physics prior if enabled)
+        solid_mask: optional [H, W] bool, True = solid
+        lambda_div, lambda_solid: soft physics penalties on x_hat1 (see below).
+        lambda_spectral: log-spectral energy-matching penalty (default 0, off).
+        lambda_obs: observation-consistency penalty — the single most important
+            correctness constraint. Penalises x_hat1[:,:,0] for disagreeing
+            with the drone observations at locations where confidence > 0.
+            Without this, the model learns "plausible wind fields given obs as
+            a hint" rather than "wind fields that are consistent with the
+            specific measurements the drone actually took." A model without
+            lambda_obs can predict low wind exactly where the drone just
+            measured high wind; this term makes that a direct training error.
+            obs_conf is already normalised to [0,1]; observations cover ~3.4%
+            of the grid, so lambda_obs=1.0 gives the obs term roughly equal
+            weight to the data term at convergence.
+
+        Returns a dict with 'total' (use for backward()) plus component losses.
         """
         B = x_target.shape[0]
         s = torch.rand(B, device=x_target.device)
@@ -368,54 +415,136 @@ class FlowMatchingModel(nn.Module):
         v_target = x_target - x_noise
         v_pred = self.forward(x_t, s, obs, mask, use_checkpoint=use_checkpoint)
 
-        if solid_mask is not None:
-            fluid = (~solid_mask).float()[None, None, None]  # [1,1,1,H,W]
-            return ((v_pred - v_target) ** 2 * fluid).mean()
-        return ((v_pred - v_target) ** 2).mean()
+        if solid_mask is None:
+            data_loss = ((v_pred - v_target) ** 2).mean()
+            zero = torch.zeros((), device=data_loss.device)
+            return {'total': data_loss, 'data': data_loss.detach(),
+                    'div': zero, 'solid': zero, 'spectral': zero, 'obs': zero}
+
+        fluid = (~solid_mask).float()[None, None, None]  # [1,1,1,H,W]
+        data_loss = ((v_pred - v_target) ** 2 * fluid).mean()
+        total = data_loss
+        div_loss = torch.zeros((), device=x_target.device)
+        solid_loss = torch.zeros((), device=x_target.device)
+        spectral_loss = torch.zeros((), device=x_target.device)
+        obs_loss = torch.zeros((), device=x_target.device)
+
+        if lambda_div > 0 or lambda_solid > 0 or lambda_spectral > 0 or lambda_obs > 0:
+            x_hat1 = (x_t + (1 - s_bc) * v_pred).float()  # one-step clean-field estimate
+            u_hat, v_hat = x_hat1[:, 0], x_hat1[:, 1]      # [B, T, H, W]
+
+            if lambda_div > 0:
+                div = torch.gradient(u_hat, dim=-1)[0] + torch.gradient(v_hat, dim=-2)[0]
+                fluid_bc = (~solid_mask)[None, None].expand_as(div).float()
+                div_loss = (div ** 2 * fluid_bc).sum() / fluid_bc.sum().clamp(min=1)
+                total = total + lambda_div * div_loss
+
+            if lambda_spectral > 0:
+                spectral_loss = self._log_spectral_loss(u_hat, v_hat,
+                                                          x_target[:, 0].float(),
+                                                          x_target[:, 1].float())
+                total = total + lambda_spectral * spectral_loss
+
+            if lambda_solid > 0:
+                solid_bc = solid_mask[None, None].expand_as(u_hat).float()
+                speed2 = u_hat ** 2 + v_hat ** 2
+                solid_loss = (speed2 * solid_bc).sum() / solid_bc.sum().clamp(min=1)
+                total = total + lambda_solid * solid_loss
+
+            if lambda_obs > 0:
+                # obs channels: 1=obs_u, 2=obs_v, 3=confidence (normalised [0,1])
+                obs_uv   = obs[:, 1:3].float()           # [B, 2, H, W]
+                obs_conf = obs[:, 3:4].float()           # [B, 1, H, W]
+                # Compare against x_hat1 at the first forecast frame (t=0),
+                # which corresponds to the field immediately after the obs window.
+                # Under quasi-steady flow this is the same as the observed field.
+                pred_uv_t0 = x_hat1[:, :, 0]            # [B, 2, H, W]
+                # Normalise by the total confidence weight rather than .mean()
+                # (which averages over ALL cells including the ~96.6% with zero
+                # confidence, diluting the obs signal ~29× into irrelevance).
+                # This measures "confidence-weighted average error at observed
+                # locations" — the same units as a pointwise velocity error.
+                n_obs = obs_conf.sum().clamp(min=1e-6)
+                obs_loss = (obs_conf * (pred_uv_t0 - obs_uv) ** 2).sum() / n_obs
+                total = total + lambda_obs * obs_loss
+
+        return {'total': total, 'data': data_loss.detach(),
+                'div': div_loss.detach(), 'solid': solid_loss.detach(),
+                'spectral': spectral_loss.detach(), 'obs': obs_loss.detach()}
 
     def sample(self, obs: torch.Tensor, mask: torch.Tensor, n_samples: int = 20,
                n_steps: int = 20, rho: float = 0.5, device: str = 'cuda',
                solid_mask: torch.Tensor = None,
-               use_physics_prior: bool = True) -> torch.Tensor:
+               use_physics_prior: bool = True,
+               chunk_size: int = 1) -> torch.Tensor:
         """
         DPS-guided ensemble generation.
         obs: [1, obs_channels, H, W] or [B, obs_channels, H, W]
         solid_mask: [H, W] bool, True = solid. Must be passed if the model
                     was trained with use_physics_prior=True (the default) —
                     the sampling source distribution has to match training.
+        chunk_size: number of samples to process simultaneously (default 1).
+            At 512×512 with T_out=10, _per_frame reshapes [B,C,T,H,W] to
+            [B*T, C, H, W] for convolutions — B=20*T=10 gives batch=200
+            inside every conv layer, requiring ~26 GB for a single fp32
+            feature map, which OOMs on 32 GB. With chunk_size=1, effective
+            inner batch is T_out=10, using ~1.3 GB for the same layer.
+            Increase only if you have confirmed headroom.
         Returns: [n_samples, 2, T_out, H, W]
         """
         T = self.T_out
         H, W = mask.shape[-2:]
+        device_t = torch.device(device) if isinstance(device, str) else device
 
-        obs_b = obs.expand(n_samples, -1, -1, -1).to(device)
-        mask_b = mask.expand(n_samples, -1, -1, -1).to(device)
+        obs_1 = obs.to(device_t)       # [1, obs_ch, H, W]
+        mask_1 = mask.to(device_t)     # [1, geo_ch, H, W]
+        solid_mask_d = solid_mask.to(device_t) if solid_mask is not None else None
 
-        if use_physics_prior and solid_mask is not None:
-            x = self.physics_prior(obs_b, solid_mask.to(device), T)
-        else:
-            x = torch.randn(n_samples, 2, T, H, W, device=device)
+        # obs for a single sample
+        obs_uv_1 = obs_1[:, 1:3]   # [1, 2, H, W]
+        conf_1   = obs_1[:, 3:4]   # [1, 1, H, W]
+
         ds = 1.0 / n_steps
-        # obs channel layout: 0=mask, 1=obs_u, 2=obs_v, 3=confidence, 4=x, 5=y
-        obs_uv = obs_b[:, 1:3]   # [n_samples, 2, H, W] measured u,v
-        conf = obs_b[:, 3:4]     # [n_samples, 1, H, W] confidence
+        all_samples = []
 
-        for step in range(n_steps):
-            s_val = step / n_steps
-            s_t = torch.full((n_samples,), s_val, device=device)
+        for start in range(0, n_samples, chunk_size):
+            end = min(start + chunk_size, n_samples)
+            B = end - start
 
-            x_req = x.detach().requires_grad_(True)
-            v_hat = self.forward(x_req, s_t, obs_b, mask_b)
-            x_hat1 = x_req + (1 - s_val) * v_hat  # estimated clean field
+            obs_b  = obs_1.expand(B, -1, -1, -1)
+            mask_b = mask_1.expand(B, -1, -1, -1)
+            obs_uv = obs_uv_1.expand(B, -1, -1, -1)
+            conf   = conf_1.expand(B, -1, -1, -1)
 
-            pred_uv = x_hat1[:, :, 0]  # [n_samples, 2, H, W]
-            obs_loss = (conf * (pred_uv - obs_uv) ** 2).sum()
-            g = torch.autograd.grad(obs_loss, x_req)[0]
+            if use_physics_prior and solid_mask_d is not None:
+                x = self.physics_prior(obs_b, solid_mask_d, T)
+            else:
+                x = torch.randn(B, 2, T, H, W, device=device_t)
 
-            with torch.no_grad():
-                x = x + ds * v_hat - rho * g
+            amp_enabled = device_t.type == 'cuda'
+            for step in range(n_steps):
+                s_val = step / n_steps
+                s_t   = torch.full((B,), s_val, device=device_t)
 
-        return x.detach()
+                x_req = x.detach().requires_grad_(True)
+                # AMP forward pass: ~2× faster via fp16 tensor cores.
+                # Gradient computation stays in fp32 — autograd returns
+                # gradients in the leaf tensor's dtype (fp32) regardless
+                # of the autocast context used during the forward pass.
+                with torch.amp.autocast('cuda', enabled=amp_enabled):
+                    v_hat = self.forward(x_req, s_t, obs_b, mask_b)
+                v_hat = v_hat.float()   # ensure fp32 before obs_loss / update
+                x_hat1   = x_req + (1 - s_val) * v_hat
+                pred_uv  = x_hat1[:, :, 0]
+                obs_loss = (conf * (pred_uv - obs_uv) ** 2).sum()
+                g = torch.autograd.grad(obs_loss, x_req)[0]
+
+                with torch.no_grad():
+                    x = x + ds * v_hat - rho * g
+
+            all_samples.append(x.detach())
+
+        return torch.cat(all_samples, dim=0)  # [n_samples, 2, T_out, H, W]
 
     @staticmethod
     def leray_project(u: torch.Tensor, v: torch.Tensor):

@@ -152,11 +152,23 @@ condition, not temporal coverage.
 - [x] Physics-informed flow-matching prior (divergence-free ambient field, not pure noise)
 - [x] Ensemble calibration utility (spread-skill correlation, interval coverage)
 - [x] Fix DPS guidance channel-slicing bug (was reading [mask,obs_v] instead of [obs_u,obs_v])
-- [ ] Full 200-epoch training run on 128 conditions × 500 snapshots (launching)
-- [ ] Evaluate: compare U-FNO (deterministic snapshot) vs flow-matching (ensemble forecast)
-- [ ] Run calibration check on a trained model (spread-error correlation, 90% coverage)
-- [ ] Implement path-conditioned exceedance probability risk metric
-- [ ] Update visualization: ensemble spread, mean field, risk overlay on candidate paths
+- [x] Divergence-residual diagnostic (`src/evaluation/calibration.py`), global + near-obstacle split
+- [x] Soft divergence + no-penetration physics penalties baked into the training loss
+      (`lambda_div`, `lambda_solid`), not just relied on post-hoc at inference
+- [x] Observation-consistency penalty (`lambda_obs=1.0`) — normalized by sum(obs_conf)
+      so it measures average error at observed locations, not diluted by unobserved
+      cells. Fixes model predicting low wind where drone measured high wind.
+- [x] AMP in sample() (~30% inference speedup, 133s → 94s); chunk_size=1 OOM fix;
+      del solver before sampling; wall-clock timing printed vs 60s budget
+- [x] Multi-segment animated dashboard (scripts/viz_fm.py): A→W1→W2→B with three
+      DPS inference updates showing prediction sharpening with observations
+- [x] Rho sweep (0.05–0.50): no meaningful effect on quality — rho is not the lever
+- [ ] Full 200-epoch training run — **Run #3 active** (lambda_div=0.1, lambda_solid=0.1,
+      lambda_obs=1.0; at epoch 10 RMSE=3.14 m/s, corr=+0.352 vs run #2 corr=-0.012)
+- [ ] Evaluate at epoch 40: full comparison run #2 ep42 vs run #3 ep40
+- [ ] Compare U-FNO (deterministic) vs flow-matching (ensemble)
+- [ ] Path-conditioned exceedance probability risk metric
+- [ ] Update visualization: spread, mean field, risk overlay on candidate paths
 
 ### Implementation Notes (June 2026)
 
@@ -174,6 +186,14 @@ condition, not temporal coverage.
   hidden=32, AMP+checkpoint, physics prior on)**: Train 0.032, Val 0.013. Confirms
   SDF channels + physics-informed prior + DPS bug fix work end-to-end on real
   data before committing to the full 200-epoch run.
+- **Training run #1 stopped at epoch 30** (val 0.000450) to add divergence +
+  no-penetration physics penalties to the loss — see "Divergence-Free Guarantee
+  Review" below. Checkpoint archived to
+  `outputs/flow_matching/fm_model_pre_physics_loss.pth`.
+- **Smoke test #3, post physics-loss changes (1 epoch, 2 conditions)**: Train
+  0.0366 (data=0.0316 div=0.0109 solid=0.0395), Val 0.0115. Component balance
+  confirmed sane (data term still dominates) before restarting the full run.
+  Training run #2 (with physics-loss penalties) launched from epoch 0.
 
 ### Recommendations Triage (June 2026)
 
@@ -215,6 +235,53 @@ flow-matching source distribution) — the source-distribution version
 implemented above captures most of the benefit (network starts closer to the
 answer) at a fraction of the engineering cost (no PDE solve per sample, reuses
 the existing Leray projection).
+
+### Divergence-Free Guarantee Review (June 2026)
+
+A follow-up review specifically asked whether the pipeline's incompressibility
+claim (the Leray projection in `infer_fm.py`) is actually guaranteed or just
+plausible. Checked directly against the code:
+
+- The Leray projection (`FlowMatchingModel.leray_project`, periodic-domain FFT)
+  is applied to the full field, then solid cells are zeroed *afterward*
+  (`infer_fm.py`). The projection has no knowledge that those cells will be
+  masked, so this ordering can reintroduce divergence right at building edges
+  — confirmed with a synthetic test (divergence-free field, masked the same
+  way): near-obstacle residual was ~47x the interior residual (1.79 vs. 0.0).
+- DPS guidance during the 20 sampling steps has no physics term at all — only
+  an observation-matching gradient (`flow_matching.py`, `sample()`). This is
+  standard practice for DPS (relies on the trained model staying near the data
+  manifold, with the projection as one-shot cleanup, not a per-step
+  constraint) — not a bug, but it means nothing is enforced mid-sampling.
+- Solid cells were entirely excluded from the training loss — the network got
+  zero gradient signal about what to predict there, which is exactly why
+  post-hoc zero-masking creates a sharp seam.
+- No diagnostic existed to check any of this. `calibration.py` covered
+  spread-skill and coverage but not divergence.
+
+Two changes made as a result:
+1. `divergence_residual()` added to `src/evaluation/calibration.py`, wired
+   into `infer_fm.py`'s printed output — global mean |div u| plus a
+   near-obstacle vs. interior split, computed on the actual post-projection,
+   post-masking field used downstream. Inference-time only, no model changes.
+2. Two soft physics penalties added to `flow_match_loss()` —
+   `lambda_div` (divergence in fluid cells) and `lambda_solid` (velocity at
+   solid cells, no-penetration), both computed on the model's own one-step
+   clean-field estimate `x_hat1 = x_t + (1-s)·v_pred` (the same quantity DPS
+   guidance already computes at inference). This gives the network explicit
+   gradient signal toward both constraints instead of relying purely on data
+   resemblance plus a post-hoc fix now known to leak at building boundaries.
+   Judged a large enough change to the training objective to restart the
+   200-epoch run from scratch rather than resume partway through.
+
+Neither change makes the guarantee exact — the projection is still only exact
+for a periodic domain, and the training penalties are soft, not hard
+constraints. The honest framing: this makes the divergence-free claim
+checkable (every `infer_fm.py` run now reports it) and measurably better
+trained-for, not mathematically guaranteed. A harder guarantee would require
+solving a proper Poisson equation with no-penetration boundary conditions at
+the obstacle walls instead of a periodic-domain FFT — judged out of scope
+until the soft-penalty approach is evaluated and found insufficient.
 
 ---
 

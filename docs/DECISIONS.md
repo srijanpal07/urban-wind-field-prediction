@@ -1,5 +1,59 @@
 # DECISIONS.md — Design Decisions & Rationale
 
+### Why lambda_obs (observation-consistency penalty) was added to training?
+
+During inference inspection at epoch 10 of run #2, the ensemble mean was nearly
+uniform blue (low wind) across the entire domain — including regions where the
+drone had just measured high wind. The model was predicting low wind exactly
+where it was told the wind was high, a fundamental data-assimilation failure.
+
+Root cause: the flow-matching loss trains the model to produce "plausible wind
+fields given the obs as a hint" — not "wind fields that reproduce the specific
+measurements in the conditioning input." DPS guidance at inference tries to
+enforce consistency, but its gradient (`rho × autograd.grad(obs_loss, x_req)`)
+was too weak: `obs_conf` is small in absolute scale, and the `.mean()` over all
+grid cells (including the ~97% with zero confidence) diluted the obs signal
+~29× relative to what it would be if measured only at observed locations.
+
+Fix: added `lambda_obs=1.0` penalty to `flow_match_loss()`:
+  `L_obs = sum(obs_conf × (x_hat1[:,:,0] − obs_uv)²) / sum(obs_conf)`
+Two key details: (a) computed on `x_hat1` (same one-step estimate as all other
+physics penalties, no new concept), and (b) normalized by `sum(obs_conf)` not
+`.mean()` — this measures "confidence-weighted mean error at observed locations"
+rather than that signal diluted across unobserved cells. At epoch 1 of run #3
+the obs component was ~32% of total loss and had dropped 85% by epoch 2, exactly
+as expected (same rapid-learning pattern as lambda_solid in run #2).
+
+At epoch 10 of run #3 vs run #2: spread-error correlation improved from -0.012
+→ +0.352 (ensemble now meaningfully uncertain in the right places), and the
+ensemble mean visually showed high wind in the correct high-speed inlet regions
+instead of the uniform-blue failure. This is the single most important training
+improvement made to the system.
+
+### Why AMP was added to sample() and what rho does
+
+`sample()` previously ran in fp32 (no autocast), while training used fp16 AMP.
+Adding `torch.amp.autocast('cuda')` around `self.forward(...)` inside the DPS
+loop cut sampling time 133s → ~94s (~30%) for free. Gradients from
+`torch.autograd.grad(obs_loss, x_req)` remain fp32 — autograd always returns
+gradients in the leaf tensor's dtype regardless of the autocast context used
+during the forward pass.
+
+**Rho sweep finding (0.05, 0.1, 0.2, 0.3, 0.5 tested on fixed condition)**:
+RMSE varied <5% and coverage varied <5% across the full range. Rho is not a
+meaningful lever — the main driver of calibration quality is the model itself
+(i.e., training). Default rho=0.5 retained.
+
+### Why chunk_size=1 in sample() (OOM fix)
+
+`_per_frame` reshapes [B,C,T,H,W] → [B*T, C, H, W] for per-frame convolutions.
+With N=20 samples and T_out=10, inner batch = 200. A single fp32 feature map
+at 200×32×512×512 ≈ 26 GB → OOM on 32 GB GPU. chunk_size=1 processes one
+sample at a time through all 20 ODE steps: inner batch = T_out=10, feature map
+≈ 1.3 GB. Only increase chunk_size if confirmed VRAM headroom exists (AMP in
+sample() freed ~15% VRAM via fp16 activations, but chunk_size=2 still didn't
+improve speed — bottleneck is Python loop overhead per ODE step, not GPU compute).
+
 ## Why LBM instead of Navier-Stokes FVM?
 
 LBM (Lattice Boltzmann Method) was chosen for the Phase 1 prototype because:
@@ -361,6 +415,67 @@ wrong. This wasn't being measured anywhere. `spread_skill()` (spread-error
 correlation) and `coverage()` (does the empirical N% interval actually contain
 truth N% of the time) are cheap numpy functions, wired into `infer_fm.py`'s
 output. No architecture change, just an evaluation gap that's now closed.
+
+### Why divergence + solid-boundary penalties added to the training loss (not just inference)?
+
+A divergence-residual diagnostic added to `infer_fm.py` (see below) confirmed
+a real gap: the post-hoc Leray projection at inference is exact only for a
+periodic domain with no internal obstacles. Masking solid cells *after*
+projecting reintroduces divergence right at building edges — exactly where
+flow physics (separation, wake formation) matters most. A synthetic test
+confirmed this concretely: a perfectly divergence-free field, masked the same
+way the pipeline does, showed near-obstacle divergence residual ~47x the
+interior residual (1.79 vs. 0.0).
+
+The previous design relied entirely on two implicit/post-hoc mechanisms: (1)
+training data being divergence-free, so MSE training tends to absorb the
+constraint as an emergent property, and (2) a one-shot Leray projection
+applied after sampling. Neither gives the network an explicit reason to
+produce divergence-free, wall-respecting output on its own — and solid cells
+were *entirely excluded* from the training loss (zero gradient signal about
+what to predict there), which is precisely why the post-hoc zero-masking step
+creates a sharp seam at building boundaries.
+
+Fix: two soft physics penalties added directly to `flow_match_loss()`,
+computed on the model's own one-step clean-field estimate
+`x_hat1 = x_t + (1-s)·v_pred` — the same quantity DPS guidance already
+computes at inference, so no new concept was introduced:
+- `lambda_div` (default 0.1): mean squared divergence of `x_hat1` in fluid cells
+- `lambda_solid` (default 0.1): mean squared velocity of `x_hat1` at solid
+  cells (no-penetration boundary condition)
+
+This doesn't make either constraint exact — it's a soft penalty, not a hard
+architectural guarantee — but it gives the network direct gradient signal to
+internalize both constraints rather than relying purely on data resemblance
+plus a post-hoc fix that's now known to leak at exactly the locations that
+matter physically. The existing post-hoc Leray projection + masking at
+inference stays as a backstop; the training-time penalties are meant to
+shrink how much correction that backstop has to make, especially near walls.
+
+A smoke test (1 epoch, 2 conditions) showed the component loss breakdown
+staying well-balanced: `Train: 0.0366 (data=0.0316 div=0.0109 solid=0.0395)`
+— the data term still dominates at lambda=0.1, with both penalties
+contributing meaningfully rather than being negligible or swamping the fit.
+This was judged a large enough change to the training objective to restart
+the in-progress 200-epoch run from scratch (was at epoch 30) rather than
+resume — resuming would mix ~30 epochs optimized against the old objective
+with the new one. The pre-change checkpoint was archived to
+`outputs/flow_matching/fm_model_pre_physics_loss.pth` rather than discarded.
+
+### Why a divergence-residual diagnostic in calibration.py / infer_fm.py?
+
+`infer_fm.py` claimed (informally, in comments) to produce divergence-free
+output via the Leray projection, but nothing actually measured whether that
+held — calibration.py only covered spread-skill and interval coverage.
+Checking the code directly confirmed the projection is applied globally
+*before* obstacle masking (`infer_fm.py`), which can reintroduce divergence
+at obstacle boundaries that a single aggregate number would hide.
+`divergence_residual()` reports both a global mean and a near-obstacle vs.
+interior split (via `scipy.ndimage.binary_dilation` on the obstacle mask), so
+the boundary-localized failure mode is directly visible rather than averaged
+away. This is inference-time instrumentation only — it doesn't change model
+behavior, just makes an existing (previously unverified) claim checkable on
+every run. It directly motivated the training-loss change above.
 
 ### Bug fix: DPS guidance was reading the wrong observation channels
 

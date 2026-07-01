@@ -171,7 +171,9 @@ def train_fm(u_all=None, v_all=None, obstacle_mask=None,
              T_out=20, n_epochs=200, batch_size=4, lr=1e-4,
              obs_window=30, device='cuda', condition_files=None,
              resume_path=None, hidden=64, n_levels=4, t_emb_dim=256,
-             use_amp=True, use_checkpoint=True, use_physics_prior=True):
+             use_amp=True, use_checkpoint=True, use_physics_prior=True,
+             lambda_div=0.1, lambda_solid=0.1, lambda_spectral=0.0,
+             lambda_obs=1.0):
     """
     Train FlowMatchingModel on multi-condition LBM data.
 
@@ -259,13 +261,15 @@ def train_fm(u_all=None, v_all=None, obstacle_mask=None,
 
     amp_ctx = lambda: torch.amp.autocast('cuda', enabled=use_amp and device.type == torch.device('cuda').type)
 
-    print(f"AMP: {use_amp}  |  Grad checkpoint: {use_checkpoint}  |  Physics prior: {use_physics_prior}")
+    print(f"AMP: {use_amp}  |  Grad checkpoint: {use_checkpoint}  |  Physics prior: {use_physics_prior}  |  "
+          f"lambda_div: {lambda_div}  |  lambda_solid: {lambda_solid}  |  "
+          f"lambda_obs: {lambda_obs}  |  lambda_spectral: {lambda_spectral}")
 
     for epoch in range(start_epoch, n_epochs):
         dataset.set_epoch(epoch)
 
         model.train()
-        train_loss = 0.0
+        train_loss = train_data = train_div = train_solid = train_spectral = train_obs = 0.0
         bar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{n_epochs}",
                    unit='batch', leave=False,
                    bar_format='{l_bar}{bar:30}{r_bar}')
@@ -276,18 +280,32 @@ def train_fm(u_all=None, v_all=None, obstacle_mask=None,
 
             optimizer.zero_grad()
             with amp_ctx():
-                loss = model.flow_match_loss(y_seq, x_in, mask_in, solid_mask,
-                                             use_checkpoint=use_checkpoint,
-                                             use_physics_prior=use_physics_prior)
+                loss_dict = model.flow_match_loss(y_seq, x_in, mask_in, solid_mask,
+                                                   use_checkpoint=use_checkpoint,
+                                                   use_physics_prior=use_physics_prior,
+                                                   lambda_div=lambda_div, lambda_solid=lambda_solid,
+                                                   lambda_spectral=lambda_spectral,
+                                                   lambda_obs=lambda_obs)
+            loss = loss_dict['total']
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item()
+            train_data += loss_dict['data'].item()
+            train_div += loss_dict['div'].item()
+            train_solid += loss_dict['solid'].item()
+            train_spectral += loss_dict['spectral'].item()
+            train_obs += loss_dict['obs'].item()
             bar.set_postfix(loss=f'{loss.item():.4f}')
 
         train_loss /= len(train_loader)
+        train_data /= len(train_loader)
+        train_div /= len(train_loader)
+        train_solid /= len(train_loader)
+        train_spectral /= len(train_loader)
+        train_obs /= len(train_loader)
 
         dataset.set_epoch(0)
         model.eval()
@@ -298,9 +316,12 @@ def train_fm(u_all=None, v_all=None, obstacle_mask=None,
                 y_seq = y_seq.to(device)
                 mask_in = mask_in.to(device)
                 with amp_ctx():
-                    loss = model.flow_match_loss(y_seq, x_in, mask_in, solid_mask,
-                                                 use_physics_prior=use_physics_prior)
-                val_loss += loss.item()
+                    loss_dict = model.flow_match_loss(y_seq, x_in, mask_in, solid_mask,
+                                                       use_physics_prior=use_physics_prior,
+                                                       lambda_div=lambda_div, lambda_solid=lambda_solid,
+                                                       lambda_spectral=lambda_spectral,
+                                                       lambda_obs=lambda_obs)
+                val_loss += loss_dict['total'].item()
 
         val_loss /= len(val_loader)
         scheduler.step()
@@ -318,11 +339,18 @@ def train_fm(u_all=None, v_all=None, obstacle_mask=None,
                         'hidden': hidden,
                         'n_levels': n_levels,
                         't_emb_dim': t_emb_dim,
-                        'use_physics_prior': use_physics_prior}, save_path)
+                        'use_physics_prior': use_physics_prior,
+                        'lambda_div': lambda_div,
+                        'lambda_solid': lambda_solid,
+                        'lambda_spectral': lambda_spectral,
+                        'lambda_obs': lambda_obs}, save_path)
             saved = '  ✓'
 
+        spectral_str = f" spectral={train_spectral:.4f}" if lambda_spectral > 0 else ""
         print(f"Epoch {epoch+1:3d}/{n_epochs} | "
-              f"Train: {train_loss:.4f} | Val: {val_loss:.4f}{saved}")
+              f"Train: {train_loss:.4f} (data={train_data:.4f} div={train_div:.4f} "
+              f"solid={train_solid:.4f} obs={train_obs:.4f}{spectral_str}) | "
+              f"Val: {val_loss:.4f}{saved}")
 
     print(f"\nTraining complete. Best val loss: {best_val:.4f}")
     return model, history

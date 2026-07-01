@@ -59,3 +59,35 @@ def reliability_curve(ensemble: np.ndarray, truth: np.ndarray, fluid_mask: np.nd
     """(nominal, empirical) coverage pairs for a reliability diagram — a
     calibrated ensemble lies on y=x."""
     return [(p, coverage(ensemble, truth, fluid_mask, interval=p)) for p in intervals]
+
+
+def divergence_residual(u: np.ndarray, v: np.ndarray, fluid_mask: np.ndarray,
+                         obstacle_mask: np.ndarray = None, boundary_width: int = 2) -> dict:
+    """
+    Mean |div u| = |du/dx + dv/dy| (finite differences, grid-cell units) over
+    fluid cells, as a check on how well the Leray projection's
+    divergence-free guarantee survives obstacle masking.
+
+    u, v: [..., H, W]
+    fluid_mask: [H, W] bool, True = fluid
+    obstacle_mask: [H, W] bool, True = solid. If given, also splits the
+        residual into cells within `boundary_width` cells of an obstacle vs.
+        the open interior. The Leray projection is an exact divergence-free
+        projection only for a periodic domain with no internal obstacles —
+        zeroing solid cells *after* projecting can reintroduce divergence
+        right at building edges even when the open interior is clean, so a
+        single aggregate number can hide a boundary-localized problem.
+    """
+    div = np.gradient(u, axis=-1) + np.gradient(v, axis=-2)
+    out = {'mean_abs_div': float(np.abs(div[..., fluid_mask]).mean())}
+
+    if obstacle_mask is not None:
+        from scipy.ndimage import binary_dilation
+        near_obstacle = binary_dilation(obstacle_mask, iterations=boundary_width) & fluid_mask
+        interior = fluid_mask & ~near_obstacle
+        if near_obstacle.any():
+            out['mean_abs_div_near_obstacle'] = float(np.abs(div[..., near_obstacle]).mean())
+        if interior.any():
+            out['mean_abs_div_interior'] = float(np.abs(div[..., interior]).mean())
+
+    return out

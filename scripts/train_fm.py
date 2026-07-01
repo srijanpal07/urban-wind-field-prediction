@@ -51,6 +51,22 @@ def main():
                          help='Use plain Gaussian noise as the flow-matching source '
                               'distribution instead of the divergence-free, '
                               'obstacle-aware physics prior (ablation only)')
+    parser.add_argument('--lambda-div', type=float, default=0.1,
+                         help='Weight on the divergence-penalty loss term in fluid '
+                              'cells (computed on the model\'s own one-step clean-field '
+                              'estimate). 0 disables it.')
+    parser.add_argument('--lambda-solid', type=float, default=0.1,
+                         help='Weight on the solid-boundary penalty (predicted velocity '
+                              '-> 0 at obstacle cells, no-penetration). 0 disables it.')
+    parser.add_argument('--lambda-obs', type=float, default=1.0,
+                         help='Weight on the observation-consistency penalty: forces '
+                              'x_hat1 to match drone observations at observed locations. '
+                              'Fixes the failure mode where the model predicts low wind '
+                              'where the drone just measured high wind. 0 disables it.')
+    parser.add_argument('--lambda-spectral', type=float, default=0.0,
+                         help='Weight on a log-spectral energy-matching penalty (targets '
+                              'MSE-induced over-smoothing). Default 0 (off) -- '
+                              'experimental, not yet validated on a real training run.')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -114,7 +130,11 @@ def main():
         resume_path=args.model if args.resume else None,
         use_amp=not args.no_amp,
         use_checkpoint=not args.no_checkpoint,
-        use_physics_prior=not args.no_physics_prior)
+        use_physics_prior=not args.no_physics_prior,
+        lambda_div=args.lambda_div,
+        lambda_solid=args.lambda_solid,
+        lambda_spectral=args.lambda_spectral,
+        lambda_obs=args.lambda_obs)
 
     # ── Training curve ────────────────────────────────────────────────────────
     import matplotlib
